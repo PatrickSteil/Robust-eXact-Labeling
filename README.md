@@ -14,14 +14,23 @@ ctest --test-dir build --output-on-failure
 ## CLI
 
 ```sh
-./build/rxl_app graph.gr 1 5 --verbose --threads 8 --export graph.rxl
+./build/rxl_app graph.gr --verbose --threads 8 --export graph.rxl
+./build/rxl_app graph.gr --benchmark          # build, then 10000 random queries
+./build/rxl_app --import graph.rxl --benchmark 50000
 ```
 
-Query endpoints are original one-based DIMACS IDs. Library APIs use zero-based
-IDs. Options:
+Options:
 
 - `--export FILE`: writes a portable little-endian binary index containing both
   label directions and the rank maps. `IndexIO::import_binary()` reads it back.
+- `--import FILE`: loads labels and rank maps from a previously exported RXL
+  index instead of building them. When `--import` is given, the graph
+  argument is optional (it is only needed if `--verbose` should also print
+  graph statistics).
+- `--benchmark [N]`: runs `N` (default 10000) random vertex-to-vertex queries
+  drawn uniformly from the index's vertex range and reports the average
+  per-query runtime (microseconds) and how many of the pairs were reachable
+  (i.e. how many shortest paths were found).
 - `--verbose`: graph degree/size statistics, label entry/size statistics,
   sampling work, label work, sampled-tree counts, progress, and elapsed time.
 - `--threads N`: number of sample-tree workers. Trees in a growth batch use the
