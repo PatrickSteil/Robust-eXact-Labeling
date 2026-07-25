@@ -53,6 +53,13 @@ std::size_t Graph::num_edges() const {
 
 void Graph::build_reverse() {
   reverse_.assign(adjacency_.size(), {});
+  // Count in-degrees first and reserve exactly, so filling reverse_[v] below
+  // never triggers the repeated reallocate-and-copy growth a bare sequence
+  // of emplace_back calls would otherwise cause.
+  std::vector<std::size_t> in_degree(adjacency_.size(), 0);
+  for (const auto &edges : adjacency_)
+    for (const auto &[v, w] : edges) ++in_degree[v];
+  for (VertexId v = 0; v < adjacency_.size(); ++v) reverse_[v].reserve(in_degree[v]);
   for (VertexId u = 0; u < adjacency_.size(); ++u)
     for (const auto &[v, w] : adjacency_[u]) reverse_[v].emplace_back(u, w);
 }

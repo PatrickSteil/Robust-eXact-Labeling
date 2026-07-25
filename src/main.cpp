@@ -1,8 +1,10 @@
 #include "graph.h"
 #include "index_io.h"
+#include "parallel_for.h"
 #include "pruned_labeling.h"
 #include "query_support.h"
 #include "statistics.h"
+#include <atomic>
 #include <cctype>
 #include <chrono>
 #include <exception>
@@ -38,23 +40,31 @@ void print_graph_statistics(const Graph &graph) {
    <<", out-degree[min/avg/max]="<<s.min_out_degree<<'/'<<s.average_out_degree<<'/'<<s.max_out_degree
    <<", isolated="<<s.isolated_vertices<<'\n';
 }
-void run_benchmark(const HubLabels &labels, std::size_t num_queries) {
+void run_benchmark(const HubLabels &labels, std::size_t num_queries, std::size_t threads) {
   const std::size_t n=labels.size();
   if(n==0) throw std::invalid_argument("cannot benchmark an empty index");
   std::mt19937_64 rng(std::random_device{}());
   std::uniform_int_distribution<VertexId> dist(0, static_cast<VertexId>(n-1));
   std::vector<std::pair<VertexId,VertexId>> queries(num_queries);
   for(auto &q:queries) q={dist(rng),dist(rng)};
-  std::size_t found=0;
+  // Each query only reads the shared labels, so the loop is embarrassingly
+  // parallel; reuse the same --threads flag as the build stage.
+  std::atomic<std::size_t> found{0};
   const auto start=std::chrono::steady_clock::now();
-  for(const auto &[s,t]:queries)
-    if(QuerySupport::distance(labels,s,t)!=kInfinity) ++found;
+  parallel_for(queries.size(), threads, [&](std::size_t lo, std::size_t hi) {
+    std::size_t local=0;
+    for(std::size_t i=lo;i<hi;++i) {
+      const auto &[s,t]=queries[i];
+      if(QuerySupport::distance(labels,s,t)!=kInfinity) ++local;
+    }
+    found.fetch_add(local, std::memory_order_relaxed);
+  });
   const auto end=std::chrono::steady_clock::now();
   const double total_us=std::chrono::duration<double,std::micro>(end-start).count();
   const double avg_us=total_us/static_cast<double>(num_queries);
-  std::cout<<"Benchmark: queries="<<num_queries
+  std::cout<<"Benchmark: queries="<<num_queries<<", threads="<<threads
    <<", average-runtime-us="<<avg_us
-   <<", found="<<found<<'/'<<num_queries<<'\n';
+   <<", found="<<found.load()<<'/'<<num_queries<<'\n';
 }
 } // namespace
 int main(int argc,char **argv) {
@@ -117,6 +127,6 @@ int main(int argc,char **argv) {
     }
 
     if(!export_path.empty()) { IndexIO::export_binary(result,export_path); if(verbose) std::cout<<"Exported index to "<<export_path<<'\n'; }
-    if(do_benchmark) run_benchmark(result.labels,benchmark_queries);
+    if(do_benchmark) run_benchmark(result.labels,benchmark_queries,threads);
   } catch(const std::exception &e) { std::cerr<<"Error: "<<e.what()<<'\n'; return 2; }
 }

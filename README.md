@@ -39,6 +39,24 @@ Options:
   because each one depends on all earlier labels.
 - `--degree`: disable sampling and use descending total degree.
 - `--no-reorder`: do not physically rename graph/label vertices by importance.
+- `--threads` also controls how many threads the `--benchmark` query loop
+  uses, in addition to the sample-tree build.
+
+## Performance notes
+
+The ordering loop reuses scratch buffers across sample-tree builds and
+per-vertex priority computations instead of reallocating them every call, and
+tracks live sample-tree vertex counts incrementally instead of rescanning
+O(n) arrays every rank. This changes constant factors only: the same sampled
+trees, same selection order, and bit-identical exported indices come out for
+a given `--threads 1` run; it's roughly 2-5x faster on graphs in the
+hundreds-to-thousands-of-vertices range with no change in output. Label
+sorting, rank reordering, and the `--benchmark` query loop are parallelized
+across `--threads` since each of their iterations is independent and they
+each only run once. The per-rank best-vertex-selection scan is *not*
+thread-parallelized even though it's technically parallel-safe: it re-enters
+every rank, so spawning threads there n times would likely cost more than it
+saves without a persistent thread pool.
 
 ## Structure
 
