@@ -78,68 +78,53 @@ int choose_distance_width(const HubLabels& labels) {
 // split into (at most) two fixed-width blocks instead of a fully
 // variable-length coding: a 1-byte-per-entry prefix for as long as deltas
 // fit in a byte, then a 4-byte-per-entry suffix for the remainder.
+//
+// Label (== DeltaLabel, see delta_label.h) already *is* this delta
+// representation in memory, so exporting no longer needs to recompute
+// deltas from decoded hub ids -- we just serialize label.raw_deltas() and
+// label.raw_distances() directly.
 void write_label(std::ostream& out, const Label& label, int distance_width) {
   if (label.size() > std::numeric_limits<std::uint32_t>::max())
     throw std::overflow_error("Label too large to export");
   const auto count = static_cast<std::uint32_t>(label.size());
   write_u32(out, count);
-  std::vector<std::uint64_t> deltas(count);
-  std::uint64_t previous_plus_one =
-      0;  // h_{i-1} + 1; starts at 0 since h_0 = -1.
-  for (std::uint32_t i = 0; i < count; ++i) {
-    const VertexId hub = label[i].first;
-    if (std::uint64_t(hub) < previous_plus_one)
-      throw std::invalid_argument(
-          "Label hub ids must be strictly increasing to delta-encode");
-    deltas[i] = std::uint64_t(hub) - previous_plus_one;
-    previous_plus_one = std::uint64_t(hub) + 1;
-  }
+  const std::vector<VertexId>& deltas = label.raw_deltas();
   std::uint32_t narrow_count = 0;
   while (narrow_count < count && deltas[narrow_count] <= 0xFFu) ++narrow_count;
   write_u32(out, narrow_count);
   for (std::uint32_t i = 0; i < narrow_count; ++i)
     write_u8(out, static_cast<std::uint8_t>(deltas[i]));
-  for (std::uint32_t i = narrow_count; i < count; ++i) {
-    if (deltas[i] > std::numeric_limits<std::uint32_t>::max())
-      throw std::overflow_error("Hub gap too large to export");
+  for (std::uint32_t i = narrow_count; i < count; ++i)
     write_u32(out, static_cast<std::uint32_t>(deltas[i]));
-  }
   // Hubs first, then distances (in the same order): distances are only
   // needed once a hub id has already matched during a query, so grouping
   // them this way keeps the common (non-matching) scan cache-friendlier.
-  for (const auto& [hub, distance] : label)
-    write_distance(out, distance, distance_width);
+  const std::vector<Distance>& distances = label.raw_distances();
+  for (std::uint32_t i = 0; i < count; ++i)
+    write_distance(out, distances[i], distance_width);
 }
 Label read_label(std::istream& in, std::size_t n, int distance_width) {
   const auto count = read_u32(in);
   const auto narrow_count = read_u32(in);
   if (narrow_count > count)
     throw std::runtime_error("Invalid label in RXL index");
-  std::vector<std::uint64_t> deltas(count);
+  std::vector<VertexId> deltas(count);
   for (std::uint32_t i = 0; i < narrow_count; ++i) deltas[i] = read_u8(in);
   for (std::uint32_t i = narrow_count; i < count; ++i) deltas[i] = read_u32(in);
-  std::vector<VertexId> hubs(count);
-  std::uint64_t previous_plus_one = 0;
-  VertexId previous = 0;
-  bool first = true;
+  std::vector<Distance> distances(count);
   for (std::uint32_t i = 0; i < count; ++i) {
-    const std::uint64_t hub = previous_plus_one + deltas[i];
-    if (hub >= n || (!first && hub <= previous))
+    distances[i] = read_distance(in, distance_width);
+    if (distances[i] == kInfinity)
       throw std::runtime_error("Invalid label in RXL index");
-    hubs[i] = static_cast<VertexId>(hub);
-    previous_plus_one = hub + 1;
-    previous = hubs[i];
-    first = false;
   }
-  Label label;
-  label.reserve(count);
-  for (std::uint32_t i = 0; i < count; ++i) {
-    const Distance distance = read_distance(in, distance_width);
-    if (distance == kInfinity)
-      throw std::runtime_error("Invalid label in RXL index");
-    label.emplace_back(hubs[i], distance);
+  // DeltaLabel::from_deltas re-derives and validates the hub ids (in range,
+  // strictly increasing) while adopting the deltas/distances as-is -- no
+  // separate decode-then-reencode step.
+  try {
+    return Label::from_deltas(std::move(deltas), std::move(distances), n);
+  } catch (const std::runtime_error&) {
+    throw std::runtime_error("Invalid label in RXL index");
   }
-  return label;
 }
 void validate_permutation(const std::vector<VertexId>& p) {
   std::vector<std::uint8_t> seen(p.size(), 0);

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "delta_label.h"
 #include "types.h"
 namespace rxl {
 
@@ -15,6 +16,10 @@ namespace rxl {
 // physically reorders via PrunedLabeling::reorder_labels_by_rank). This
 // decoupling means hub ids cluster into small, delta-compressible values
 // for important/frequent hubs without needing to renumber any vertex.
+//
+// forward/backward are DeltaLabel (see delta_label.h): hub ids are kept
+// delta-encoded even while labels are being built by PrunedLabeling, not
+// just when exported by IndexIO.
 
 struct HubLabel {
   Label forward;

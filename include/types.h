@@ -17,8 +17,6 @@ constexpr Distance kInfinity = std::numeric_limits<Distance>::max();
 
 using Edge = std::pair<VertexId, Distance>;
 using AdjacencyList = std::vector<std::vector<Edge>>;
-using LabelEntry = std::pair<VertexId, Distance>;
-using Label = std::vector<LabelEntry>;
-} // namespace rxl
+}  // namespace rxl
 
 #endif

@@ -56,7 +56,7 @@ std::uint64_t pruned_dijkstra(const AdjacencyList& graph, VertexId root,
     // hub_id is root's processing rank, assigned by the caller. This is
     // what makes hub IDs inside labels small/clustered for important
     // (early-processed) vertices without renumbering any vertex.
-    output.emplace_back(hub_id, du);
+    output.push_back(hub_id, du);
     work += graph[u].size();
     for (const auto& [v, weight] : graph[u]) {
       const std::uint64_t candidate = std::uint64_t(du) + weight;
@@ -403,12 +403,14 @@ std::vector<VertexId> sampled_order(const Graph& graph,
 
 LabelingResult finish(HubLabels labels, std::vector<VertexId> order,
                       std::size_t threads) {
-  parallel_for(labels.size(), threads, [&](std::size_t lo, std::size_t hi) {
-    for (std::size_t i = lo; i < hi; ++i) {
-      std::sort(labels[i].forward.begin(), labels[i].forward.end());
-      std::sort(labels[i].backward.begin(), labels[i].backward.end());
-    }
-  });
+  (void)threads;
+  // No sorting step needed here anymore. Hub ids appended to a label are
+  // already strictly increasing by construction: add_hub()/pruned_dijkstra()
+  // always push_back() with hub_id equal to the *current* rank, and ranks
+  // only ever increase across the single pass over 0..n-1 that drives both
+  // compute() and compute_with_degree_order(). DeltaLabel::push_back() also
+  // enforces this at build time (it throws on an out-of-order hub id), so
+  // this invariant is checked, not just assumed.
   std::vector<Rank> ranks(order.size());
   for (Rank rank = 0; rank < order.size(); ++rank) ranks[order[rank]] = rank;
   return {std::move(labels), std::move(order), std::move(ranks), {}};

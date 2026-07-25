@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <tuple>
 
+#include "delta_label.h"
 #include "dijkstra.h"
 #include "graph.h"
 #include "index_io.h"
@@ -17,6 +18,76 @@ using namespace rxl;
   do {                                                                      \
     if (!(x)) throw std::runtime_error(std::string("CHECK failed: ") + #x); \
   } while (0)
+// DeltaLabel is deliberately its own class (delta_label.h) so it can be
+// tested in isolation from graphs/labeling/queries.
+void test_delta_label() {
+  DeltaLabel label;
+  CHECK(label.empty());
+  CHECK(label.size() == 0);
+  label.push_back(0, 0);
+  label.push_back(16, 5);
+  label.push_back(29, 9);
+  label.push_back(189, 12);
+  CHECK(!label.empty());
+  CHECK(label.size() == 4);
+
+  // Decoding via the iterator must reproduce exactly what was pushed.
+  std::vector<std::pair<VertexId, Distance>> decoded(label.begin(),
+                                                      label.end());
+  const std::vector<std::pair<VertexId, Distance>> expected{
+      {0, 0}, {16, 5}, {29, 9}, {189, 12}};
+  CHECK(decoded == expected);
+
+  // Matches the example in the paper (Section 4.1): hubs (0 16 29 189)
+  // delta-encode to (0 15 12 159).
+  const std::vector<VertexId> expected_deltas{0, 15, 12, 159};
+  CHECK(label.raw_deltas() == expected_deltas);
+
+  // Structured bindings must work on the decoded entries, same as before.
+  VertexId sum_hubs = 0;
+  for (const auto& [hub, d] : label) sum_hubs += hub + d;
+  CHECK(sum_hubs == 0 + 0 + 16 + 5 + 29 + 9 + 189 + 12);
+
+  // Strictly-increasing invariant is enforced at push time.
+  bool threw = false;
+  try {
+    label.push_back(189, 1);  // repeat of the last hub id
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+  threw = false;
+  try {
+    label.push_back(5, 1);  // smaller than the last hub id
+  } catch (const std::invalid_argument&) {
+    threw = true;
+  }
+  CHECK(threw);
+
+  // from_deltas() is the inverse of raw_deltas()/raw_distances(), and
+  // validates that decoded hub ids stay within range.
+  auto rebuilt = DeltaLabel::from_deltas(label.raw_deltas(),
+                                        {label.raw_distances().begin(),
+                                         label.raw_distances().end()},
+                                        /*n=*/200);
+  const std::vector<std::pair<VertexId, Distance>> rebuilt_decoded(
+      rebuilt.begin(), rebuilt.end());
+  CHECK(rebuilt_decoded == expected);
+  bool out_of_range = false;
+  try {
+    DeltaLabel::from_deltas(label.raw_deltas(), label.raw_distances(),
+                            /*n=*/189);  // hub 189 is not < 189
+  } catch (const std::runtime_error&) {
+    out_of_range = true;
+  }
+  CHECK(out_of_range);
+
+  // An empty label iterates zero times and round-trips cleanly.
+  DeltaLabel empty_label;
+  CHECK(empty_label.begin() == empty_label.end());
+  auto rebuilt_empty = DeltaLabel::from_deltas({}, {}, 10);
+  CHECK(rebuilt_empty.empty());
+}
 Graph make_graph(
     std::size_t n,
     const std::vector<std::tuple<VertexId, VertexId, Distance>>& arcs) {
@@ -136,6 +207,7 @@ void test_statistics() {
 }
 int main() {
   try {
+    test_delta_label();
     test_directed_weighted();
     test_rank_reorder();
     test_export_roundtrip();
