@@ -71,17 +71,19 @@ void test_delta_label() {
   CHECK(threw);
 
   // from_deltas() is the inverse of raw_deltas()/raw_distances(), and
-  // validates that decoded hub ids stay within range.
-  auto rebuilt = DeltaLabel::from_deltas(
-      label.raw_deltas(),
-      {label.raw_distances().begin(), label.raw_distances().end()},
-      /*n=*/200);
+  // validates that decoded hub ids stay within range. raw_distances()
+  // materializes a fresh flat vector each call (the label's actual storage
+  // is run-length encoded, see delta_label.h), so it's bound to a local
+  // once rather than called twice in the same expression.
+  const std::vector<Distance> flat_distances = label.raw_distances();
+  auto rebuilt = DeltaLabel::from_deltas(label.raw_deltas(), flat_distances,
+                                        /*n=*/200);
   const std::vector<std::pair<VertexId, Distance>> rebuilt_decoded(
       rebuilt.begin(), rebuilt.end());
   CHECK(rebuilt_decoded == expected);
   bool out_of_range = false;
   try {
-    DeltaLabel::from_deltas(label.raw_deltas(), label.raw_distances(),
+    DeltaLabel::from_deltas(label.raw_deltas(), flat_distances,
                             /*n=*/189);  // hub 189 is not < 189
   } catch (const std::runtime_error&) {
     out_of_range = true;

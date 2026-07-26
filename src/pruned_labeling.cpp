@@ -89,6 +89,17 @@ struct SampleTree {
   SampleTreeStorage storage;
   std::vector<VertexId> members;
   std::size_t remaining = 0;
+
+  // Rewinds an already-retired SampleTree (remaining == 0) into a fresh,
+  // empty one for a new root, reusing its storage's and members' existing
+  // allocations instead of destroying this object and default-constructing
+  // a new one -- see the tree_pool in sampled_order() below.
+  void reset(std::size_t n, std::size_t new_bucket) {
+    storage.reset(n);
+    members.clear();  // keeps members' capacity for the new tree to refill.
+    remaining = 0;
+    bucket = new_bucket;
+  }
 };
 
 struct TreeScratch {
@@ -98,9 +109,10 @@ struct TreeScratch {
   std::vector<VertexId> distance_touched;
 };
 
-SampleTree build_sample_tree(const Graph& graph, VertexId root,
-                             const HubLabels& labels, std::size_t bucket,
-                             std::uint64_t& work, TreeScratch& scratch) {
+void build_sample_tree(const Graph& graph, VertexId root,
+                       const HubLabels& labels, std::size_t bucket,
+                       std::uint64_t& work, TreeScratch& scratch,
+                       SampleTree& tree) {
   const std::size_t n = graph.num_vertices();
   if (scratch.root_lookup.size() != n) {
     scratch.root_lookup.assign(n, kInfinity);
@@ -111,13 +123,16 @@ SampleTree build_sample_tree(const Graph& graph, VertexId root,
   auto& lookup_touched = scratch.lookup_touched;
   auto& distance_touched = scratch.distance_touched;
 
-  SampleTree tree(n);
-  tree.bucket = bucket;
+  tree.reset(n, bucket);
   for (const auto& [hub, d] : labels[root].forward) {
     root_lookup[hub] = d;
     lookup_touched.push_back(hub);
   }
-  std::vector<VertexId> settled;
+  // Grown directly into tree.members (already emptied by tree.reset() above,
+  // but keeping whatever capacity it held from this SampleTree's previous
+  // life) rather than a fresh local vector that gets move-assigned in at
+  // the end.
+  auto& settled = tree.members;
   AbstractDijkstra::search(
       root,
       [&graph](VertexId u) -> const std::vector<Edge>& {
@@ -156,14 +171,12 @@ SampleTree build_sample_tree(const Graph& graph, VertexId root,
       tree.storage.add_subtree(parent, tree.storage.subtree_of(v));
   }
   tree.remaining = settled.size();
-  tree.members = std::move(settled);
   tree.storage.maybe_downgrade(tree.members, tree.remaining);
 
   for (VertexId v : distance_touched) distance[v] = kInfinity;
   distance_touched.clear();
   for (VertexId hub : lookup_touched) root_lookup[hub] = kInfinity;
   lookup_touched.clear();
-  return tree;
 }
 
 void add_tree_scores(const SampleTree& tree,
@@ -229,6 +242,22 @@ std::vector<VertexId> sampled_order(const Graph& graph,
 
   std::vector<SampleTree> trees;
   trees.reserve(initial + n / 8 + 1);
+  // Retired trees (remaining == 0, see the erase-remove below) are parked
+  // here instead of being destroyed, so growing a new tree can rewind one
+  // of these in place (SampleTree::reset()) rather than default-
+  // constructing a brand new SampleTree(n) -- which would mean freshly
+  // allocating its four O(n) dense arrays every single time a new sample
+  // tree is grown (Section 3.3 / Appendix A.2: this happens repeatedly
+  // throughout the run, not just for the `initial` trees).
+  std::vector<SampleTree> tree_pool;
+  auto acquire_tree = [&]() -> SampleTree {
+    if (!tree_pool.empty()) {
+      SampleTree tree = std::move(tree_pool.back());
+      tree_pool.pop_back();
+      return tree;
+    }
+    return SampleTree(n);
+  };
   std::vector<std::vector<Score>> counters(n, std::vector<Score>(buckets, 0));
   std::uint64_t tree_work = 0, label_work = 0;
   const std::size_t threads = std::max<std::size_t>(1, options.num_threads);
@@ -242,26 +271,42 @@ std::vector<VertexId> sampled_order(const Graph& graph,
     if (threads == 1 || batch_roots.size() == 1) {
       for (std::size_t i = 0; i < batch_roots.size(); ++i) {
         std::uint64_t work = 0;
-        auto tree = build_sample_tree(graph, batch_roots[i], labels,
-                                      (first_bucket + i) % buckets, work,
-                                      scratch_pool[0]);
+        SampleTree tree = acquire_tree();
+        build_sample_tree(graph, batch_roots[i], labels,
+                          (first_bucket + i) % buckets, work, scratch_pool[0],
+                          tree);
         built.emplace_back(std::move(tree), work);
       }
     } else {
-      std::vector<std::future<Built>> futures;
+      // tree_pool is only ever touched from the main thread: every lane's
+      // tree is acquired here, before any std::async task is launched, and
+      // handed to that lane by reference -- each async task only ever
+      // touches its own lane_trees[i], so there is no concurrent access to
+      // the pool itself or to any other lane's tree.
+      std::vector<SampleTree> lane_trees;
+      lane_trees.reserve(batch_roots.size());
+      for (std::size_t i = 0; i < batch_roots.size(); ++i)
+        lane_trees.push_back(acquire_tree());
+      std::vector<std::future<std::uint64_t>> futures;
       futures.reserve(batch_roots.size());
       for (std::size_t i = 0; i < batch_roots.size(); ++i) {
         const VertexId root = batch_roots[i];
         const std::size_t bucket = (first_bucket + i) % buckets;
         TreeScratch& lane = scratch_pool[i];
-        futures.emplace_back(std::async(std::launch::async, [&, root, bucket] {
-          std::uint64_t work = 0;
-          auto tree =
-              build_sample_tree(graph, root, labels, bucket, work, lane);
-          return Built{std::move(tree), work};
-        }));
+        SampleTree& tree = lane_trees[i];
+        futures.emplace_back(
+            std::async(std::launch::async, [&graph, &labels, &lane, &tree,
+                                            root, bucket] {
+              std::uint64_t work = 0;
+              build_sample_tree(graph, root, labels, bucket, work, lane,
+                                tree);
+              return work;
+            }));
       }
-      for (auto& future : futures) built.push_back(future.get());
+      for (std::size_t i = 0; i < futures.size(); ++i) {
+        const std::uint64_t work = futures[i].get();
+        built.emplace_back(std::move(lane_trees[i]), work);
+      }
     }
     for (auto& item : built) {
       tree_work += item.second;
@@ -328,9 +373,19 @@ std::vector<VertexId> sampled_order(const Graph& graph,
       live_vertices -= remove_subtree(tree, best, counters, downgraded);
       if (downgraded) ++stats.sparse_downgrades;
     }
-    trees.erase(std::remove_if(
-                    trees.begin(), trees.end(),
-                    [](const SampleTree& tree) { return tree.remaining == 0; }),
+    trees.erase(std::remove_if(trees.begin(), trees.end(),
+                               [&](SampleTree& tree) {
+                                 if (tree.remaining != 0) return false;
+                                 // Move out this tree's guts (storage's
+                                 // dense arrays, members' capacity) before
+                                 // it's logically "removed" -- it may still
+                                 // get overwritten in place by a later
+                                 // surviving element's move-assignment as
+                                 // remove_if compacts the vector, but that's
+                                 // fine, we've already taken what we need.
+                                 tree_pool.push_back(std::move(tree));
+                                 return true;
+                               }),
                 trees.end());
 
     std::size_t attempts = 0;

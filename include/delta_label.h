@@ -1,6 +1,7 @@
 #ifndef RXL_DELTA_LABEL_H
 #define RXL_DELTA_LABEL_H
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -9,6 +10,24 @@
 
 namespace rxl {
 
+// A label's hubs are stored as two parallel arrays -- never as
+// vector<pair<VertexId, Distance>> -- so each field can use the encoding
+// that actually suits it:
+//   - deltas_: hub ids as gaps from the previous hub id (Section 4.1). This
+//     is what makes the on-disk "two-block" scheme (index_io.cpp) possible
+//     in the first place, and it stays exactly that: a plain per-entry
+//     array, never run-length encoded. Hub ids are (almost) all distinct
+//     from their neighbors by construction, so a run-length scheme would
+//     essentially degenerate to one run per entry and just add overhead.
+//   - run_values_/run_lengths_: distances, run-length encoded. Because
+//     canonical labels are built from a single vertex (Section 2), long
+//     stretches of a label commonly share the same distance to the root
+//     (e.g. an unweighted BFS frontier, or a tie-heavy region of a weighted
+//     graph), so RLE is the natural fit here. Crucially, this compression
+//     happens as hubs are pushed during PL/SamPG construction (push_back
+//     merges into the current run immediately), not only when exporting --
+//     the label never materializes a flat per-entry distance array
+//     in-memory in the first place.
 class DeltaLabel {
  public:
   using Entry = std::pair<VertexId, Distance>;
@@ -21,13 +40,29 @@ class DeltaLabel {
     using pointer = const Entry*;
     using reference = Entry;
 
-    reference operator*() const { return {current_hub_, (*label_)[index_]}; }
+    // No random access into run_values_/run_lengths_ here: all state
+    // needed to decode the current entry (current_hub_, current_distance_,
+    // run_remaining_, run_index_) lives in the iterator itself. That keeps
+    // decoding an O(1)-amortized forward walk (exactly what the mergesort-
+    // style HL query needs, see query_support.cpp) and, just as important,
+    // keeps DeltaLabel free of any mutable "last position" cache on the
+    // label object -- multiple threads routinely hold const_iterators over
+    // the very same label concurrently (e.g. many concurrent pruned
+    // Dijkstra searches all reading labels[u] while building the labeling),
+    // so any shared mutable decode-cursor would be a data race.
+    reference operator*() const { return {current_hub_, current_distance_}; }
 
     const_iterator& operator++() {
       ++index_;
-      if (index_ < label_->deltas_.size())
-        current_hub_ =
-            static_cast<VertexId>(current_hub_ + 1 + label_->deltas_[index_]);
+      if (index_ < label_->deltas_.size()) {
+        current_hub_ = static_cast<VertexId>(current_hub_ + 1 +
+                                             label_->deltas_[index_]);
+        if (--run_remaining_ == 0) {
+          ++run_index_;
+          current_distance_ = label_->run_values_[run_index_];
+          run_remaining_ = label_->run_lengths_[run_index_];
+        }
+      }
       return *this;
     }
     const_iterator operator++(int) {
@@ -46,10 +81,25 @@ class DeltaLabel {
     friend class DeltaLabel;
     const_iterator(const DeltaLabel* label, std::size_t index,
                    VertexId current_hub)
-        : label_(label), index_(index), current_hub_(current_hub) {}
+        : label_(label), index_(index), current_hub_(current_hub) {
+      if (index_ < label_->deltas_.size()) {
+        run_index_ = 0;
+        current_distance_ = label_->run_values_[0];
+        run_remaining_ = label_->run_lengths_[0];
+      } else {
+        // end() iterator: never dereferenced or incremented, so these just
+        // need to be well-defined values.
+        run_index_ = 0;
+        current_distance_ = 0;
+        run_remaining_ = 0;
+      }
+    }
     const DeltaLabel* label_;
     std::size_t index_;
     VertexId current_hub_;
+    std::size_t run_index_;
+    Distance current_distance_;
+    std::uint32_t run_remaining_;
   };
   using iterator = const_iterator;
 
@@ -71,13 +121,16 @@ class DeltaLabel {
           "DeltaLabel: hub ids must be inserted in strictly increasing "
           "order");
     deltas_.push_back(hub - next_min_hub_);
-    distances_.push_back(distance);
+    extend_or_start_run(distance);
     next_min_hub_ = hub + 1;
   }
 
   void reserve(std::size_t n) {
     deltas_.reserve(n);
-    distances_.reserve(n);
+    // Upper bound (no run-merging assumed yet); harmless if the label ends
+    // up with far fewer runs than entries, which is the whole point of RLE.
+    run_values_.reserve(n);
+    run_lengths_.reserve(n);
   }
   std::size_t size() const { return deltas_.size(); }
   bool empty() const { return deltas_.empty(); }
@@ -88,7 +141,25 @@ class DeltaLabel {
   const_iterator end() const { return const_iterator(this, deltas_.size(), 0); }
 
   const std::vector<VertexId>& raw_deltas() const { return deltas_; }
-  const std::vector<Distance>& raw_distances() const { return distances_; }
+  // Run-length-encoded distances: run_values_[i] repeated run_lengths_[i]
+  // times, for i = 0, 1, .... This is the representation actually stored,
+  // and what index_io.cpp serializes directly -- no expand-then-recompress
+  // step at export time.
+  const std::vector<Distance>& raw_run_values() const { return run_values_; }
+  const std::vector<std::uint32_t>& raw_run_lengths() const {
+    return run_lengths_;
+  }
+  // Convenience for callers that want the flat per-entry sequence (e.g.
+  // tests). Materializes it on demand in O(size); nothing on any hot path
+  // (construction or query) ever calls this.
+  std::vector<Distance> raw_distances() const {
+    std::vector<Distance> flat;
+    flat.reserve(deltas_.size());
+    for (std::size_t r = 0; r < run_values_.size(); ++r)
+      for (std::uint32_t k = 0; k < run_lengths_[r]; ++k)
+        flat.push_back(run_values_[r]);
+    return flat;
+  }
 
   static DeltaLabel from_deltas(std::vector<VertexId> deltas,
                                 std::vector<Distance> distances,
@@ -106,16 +177,64 @@ class DeltaLabel {
       next_min = hub + 1;
     }
     label.deltas_ = std::move(deltas);
-    label.distances_ = std::move(distances);
+    // Fold the flat sequence into runs (same merge rule as push_back), so
+    // a caller handing us plain per-entry distances still ends up with the
+    // compressed in-memory representation.
+    for (const Distance d : distances) label.extend_or_start_run(d);
+    label.next_min_hub_ = static_cast<VertexId>(next_min);
+    return label;
+  }
+
+  // Rebuilds a label directly from already-run-length-encoded arrays (what
+  // index_io.cpp reads back off disk): no expand-to-flat-then-recompress
+  // round trip, since the runs it read are already exactly this label's
+  // internal representation.
+  static DeltaLabel from_runs(std::vector<VertexId> deltas,
+                              std::vector<Distance> run_values,
+                              std::vector<std::uint32_t> run_lengths,
+                              std::size_t n) {
+    if (run_values.size() != run_lengths.size())
+      throw std::invalid_argument(
+          "DeltaLabel::from_runs: mismatched run arrays");
+    std::uint64_t total = 0;
+    for (const std::uint32_t len : run_lengths) {
+      if (len == 0)
+        throw std::invalid_argument(
+            "DeltaLabel::from_runs: zero-length run");
+      total += len;
+    }
+    if (total != deltas.size())
+      throw std::invalid_argument(
+          "DeltaLabel::from_runs: run lengths do not match delta count");
+    DeltaLabel label;
+    std::uint64_t next_min = 0;
+    for (std::size_t i = 0; i < deltas.size(); ++i) {
+      const std::uint64_t hub = next_min + deltas[i];
+      if (hub >= n)
+        throw std::runtime_error("DeltaLabel::from_runs: hub id out of range");
+      next_min = hub + 1;
+    }
+    label.deltas_ = std::move(deltas);
+    label.run_values_ = std::move(run_values);
+    label.run_lengths_ = std::move(run_lengths);
     label.next_min_hub_ = static_cast<VertexId>(next_min);
     return label;
   }
 
  private:
-  Distance operator[](std::size_t index) const { return distances_[index]; }
+  void extend_or_start_run(Distance distance) {
+    if (!run_lengths_.empty() && run_values_.back() == distance &&
+        run_lengths_.back() < std::numeric_limits<std::uint32_t>::max()) {
+      ++run_lengths_.back();
+    } else {
+      run_values_.push_back(distance);
+      run_lengths_.push_back(1);
+    }
+  }
 
   std::vector<VertexId> deltas_;
-  std::vector<Distance> distances_;
+  std::vector<Distance> run_values_;
+  std::vector<std::uint32_t> run_lengths_;
   VertexId next_min_hub_ = 0;
 };
 

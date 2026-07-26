@@ -1,5 +1,6 @@
 #ifndef RXL_SAMPLE_TREE_STORAGE_H
 #define RXL_SAMPLE_TREE_STORAGE_H
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <sparsehash/sparse_hash_map>
@@ -87,6 +88,43 @@ class SampleTreeStorage {
   SampleTreeStorage& operator=(const SampleTreeStorage&) = delete;
 
   bool is_dense() const { return is_dense_; }
+
+  // Rewinds this storage to a fresh, empty, all-dense tree over the same n
+  // vertices, reusing already-allocated capacity instead of releasing it
+  // and reallocating (as replacing a retired SampleTree with a brand new
+  // one would). If this storage was still dense, dense_parent_/
+  // dense_alive_/dense_subtree_ are refilled in place via assign() (which
+  // reuses the existing buffer whenever its capacity already fits n, the
+  // overwhelmingly common case here since n never changes across a run),
+  // and each per-vertex children_ list is cleared rather than destroyed --
+  // so vertices that repeatedly end up with a handful of children across
+  // many trees don't pay for that vector's growth every single time. If it
+  // had already downgraded to sparse (its dense arrays freed for good, see
+  // maybe_downgrade()), there is nothing dense left to reuse; it goes back
+  // to plain O(n) dense arrays exactly as a newly-constructed
+  // SampleTreeStorage would, and the sparse map is cleared (not
+  // reallocated away) so its bucket array can be reused if this tree
+  // downgrades again later.
+  void reset(std::size_t n) {
+    n_ = n;
+    is_dense_ = true;
+    if (dense_parent_.size() == n_) {
+      std::fill(dense_parent_.begin(), dense_parent_.end(), kInvalidVertex);
+      std::fill(dense_alive_.begin(), dense_alive_.end(), 0);
+      std::fill(dense_subtree_.begin(), dense_subtree_.end(), 0);
+      for (auto& children : dense_children_) children.clear();
+    } else {
+      dense_parent_.assign(n_, kInvalidVertex);
+      dense_children_.assign(n_, {});
+      dense_alive_.assign(n_, 0);
+      dense_subtree_.assign(n_, 0);
+    }
+    // sparse_hash_map::clear() already empties the table without
+    // deallocating its bucket array (see sparsehashtable.h), so a tree
+    // that previously downgraded keeps that allocation available if it
+    // downgrades again on its next life.
+    if (!sparse_.empty()) sparse_.clear();
+  }
 
   bool alive(VertexId v) const {
     if (is_dense_) return dense_alive_[v] != 0;

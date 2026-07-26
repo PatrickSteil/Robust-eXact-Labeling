@@ -84,7 +84,11 @@ std::uint32_t read_varint(std::istream& in) {
 // anywhere in the labeling. Chosen once, globally, and recorded in the file
 // header, per the paper's basic compression scheme (Section 4.1): "we
 // represent distances with as few bits (8, 16, or 32) as needed for the
-// largest distance stored in any label."
+// largest distance stored in any label." Walking each label's public
+// iterator (rather than its raw run array) is deliberate: the max distance
+// is the same either way, and going through the iterator means this
+// function doesn't need to know anything about the run-length
+// representation at all.
 int choose_distance_width(const HubLabels& labels) {
   Distance max_distance = 0;
   for (const auto& entry : labels) {
@@ -97,11 +101,13 @@ int choose_distance_width(const HubLabels& labels) {
   if (max_distance < (1u << 16)) return 2;
   return 4;
 }
-// Label (== DeltaLabel, see delta_label.h) already *is* the delta
-// representation in memory (gaps from the previous hub id), regardless of
-// which encoding writes it out -- exporting never needs to recompute deltas
-// from decoded hub ids, just serialize label.raw_deltas()/raw_distances()
-// in whichever byte scheme was requested.
+// Label (== DeltaLabel, see delta_label.h) already *is* the on-disk
+// representation in memory: hub ids as gaps from the previous hub id, and
+// distances as (value, run length) pairs, both built up incrementally as
+// hubs are added during PL/SamPG rather than derived at export time. So
+// exporting is just serializing label.raw_deltas()/raw_run_values()/
+// raw_run_lengths() in whichever byte scheme was requested -- no
+// expand-to-flat-then-recompress step.
 void write_label(std::ostream& out, const Label& label, LabelEncoding encoding,
                  int distance_width) {
   if (label.size() > std::numeric_limits<std::uint32_t>::max())
@@ -109,29 +115,40 @@ void write_label(std::ostream& out, const Label& label, LabelEncoding encoding,
   const auto count = static_cast<std::uint32_t>(label.size());
   write_u32(out, count);
   const std::vector<VertexId>& deltas = label.raw_deltas();
-  const std::vector<Distance>& distances = label.raw_distances();
+  // Hub-id deltas: two-block or varint, exactly as before -- distances
+  // moving to a run-length scheme doesn't change how hub ids are packed.
   if (encoding == LabelEncoding::Varint) {
     for (std::uint32_t i = 0; i < count; ++i) write_varint(out, deltas[i]);
-    for (std::uint32_t i = 0; i < count; ++i)
-      write_varint(out, static_cast<std::uint32_t>(distances[i]));
-    return;
+  } else {
+    // TwoBlockDelta: split into (at most) two fixed-width blocks instead of
+    // a fully variable-length coding, to keep decoding branch-free -- a
+    // 1-byte-per-entry prefix for as long as deltas fit in a byte, then a
+    // 4-byte-per-entry suffix for the remainder.
+    std::uint32_t narrow_count = 0;
+    while (narrow_count < count && deltas[narrow_count] <= 0xFFu)
+      ++narrow_count;
+    write_u32(out, narrow_count);
+    for (std::uint32_t i = 0; i < narrow_count; ++i)
+      write_u8(out, static_cast<std::uint8_t>(deltas[i]));
+    for (std::uint32_t i = narrow_count; i < count; ++i)
+      write_u32(out, static_cast<std::uint32_t>(deltas[i]));
   }
-  // TwoBlockDelta: split into (at most) two fixed-width blocks instead of a
-  // fully variable-length coding, to keep decoding branch-free -- a 1-byte-
-  // per-entry prefix for as long as deltas fit in a byte, then a 4-byte-
-  // per-entry suffix for the remainder.
-  std::uint32_t narrow_count = 0;
-  while (narrow_count < count && deltas[narrow_count] <= 0xFFu) ++narrow_count;
-  write_u32(out, narrow_count);
-  for (std::uint32_t i = 0; i < narrow_count; ++i)
-    write_u8(out, static_cast<std::uint8_t>(deltas[i]));
-  for (std::uint32_t i = narrow_count; i < count; ++i)
-    write_u32(out, static_cast<std::uint32_t>(deltas[i]));
-  // Hubs first, then distances (in the same order): distances are only
-  // needed once a hub id has already matched during a query, so grouping
-  // them this way keeps the common (non-matching) scan cache-friendlier.
-  for (std::uint32_t i = 0; i < count; ++i)
-    write_distance(out, distances[i], distance_width);
+  // Distances: run-length encoded. Each run contributes one value (packed
+  // the same way a single distance always was: fixed-width for
+  // TwoBlockDelta, varint for Varint) plus a varint run length -- lengths
+  // are small and heavily skewed toward 1, so they're not worth a fixed
+  // width of their own regardless of which scheme the values use.
+  const std::vector<Distance>& run_values = label.raw_run_values();
+  const std::vector<std::uint32_t>& run_lengths = label.raw_run_lengths();
+  const auto run_count = static_cast<std::uint32_t>(run_values.size());
+  write_u32(out, run_count);
+  for (std::uint32_t i = 0; i < run_count; ++i) {
+    if (encoding == LabelEncoding::Varint)
+      write_varint(out, static_cast<std::uint32_t>(run_values[i]));
+    else
+      write_distance(out, run_values[i], distance_width);
+    write_varint(out, run_lengths[i]);
+  }
 }
 Label read_label(std::istream& in, std::size_t n, LabelEncoding encoding,
                  int distance_width) {
@@ -140,17 +157,11 @@ Label read_label(std::istream& in, std::size_t n, LabelEncoding encoding,
   // can never legitimately hold more than n entries. Checking this before
   // allocating rejects a corrupt or truncated count with a clear error
   // instead of first attempting a (possibly huge, since count comes
-  // straight from the file) allocation for `deltas`/`distances`.
+  // straight from the file) allocation for `deltas`.
   if (count > n) throw std::runtime_error("Invalid label in RXL index");
   std::vector<VertexId> deltas(count);
-  std::vector<Distance> distances(count);
   if (encoding == LabelEncoding::Varint) {
     for (std::uint32_t i = 0; i < count; ++i) deltas[i] = read_varint(in);
-    for (std::uint32_t i = 0; i < count; ++i) {
-      distances[i] = read_varint(in);
-      if (distances[i] == kInfinity)
-        throw std::runtime_error("Invalid label in RXL index");
-    }
   } else {
     const auto narrow_count = read_u32(in);
     if (narrow_count > count)
@@ -158,18 +169,37 @@ Label read_label(std::istream& in, std::size_t n, LabelEncoding encoding,
     for (std::uint32_t i = 0; i < narrow_count; ++i) deltas[i] = read_u8(in);
     for (std::uint32_t i = narrow_count; i < count; ++i)
       deltas[i] = read_u32(in);
-    for (std::uint32_t i = 0; i < count; ++i) {
-      distances[i] = read_distance(in, distance_width);
-      if (distances[i] == kInfinity)
-        throw std::runtime_error("Invalid label in RXL index");
-    }
   }
-  // DeltaLabel::from_deltas re-derives and validates the hub ids (in range,
-  // strictly increasing) while adopting the deltas/distances as-is -- no
+  // A run can never legitimately outnumber the entries it covers (each run
+  // is at least length 1), so run_count > count is already corrupt --
+  // reject it before allocating, same reasoning as the `count > n` check
+  // above.
+  const auto run_count = read_u32(in);
+  if (run_count > count) throw std::runtime_error("Invalid label in RXL index");
+  std::vector<Distance> run_values(run_count);
+  std::vector<std::uint32_t> run_lengths(run_count);
+  std::uint64_t total = 0;
+  for (std::uint32_t i = 0; i < run_count; ++i) {
+    run_values[i] = encoding == LabelEncoding::Varint
+                       ? read_varint(in)
+                       : read_distance(in, distance_width);
+    if (run_values[i] == kInfinity)
+      throw std::runtime_error("Invalid label in RXL index");
+    run_lengths[i] = read_varint(in);
+    if (run_lengths[i] == 0)
+      throw std::runtime_error("Invalid label in RXL index");
+    total += run_lengths[i];
+  }
+  if (total != count) throw std::runtime_error("Invalid label in RXL index");
+  // DeltaLabel::from_runs re-derives and validates the hub ids (in range,
+  // strictly increasing) while adopting the deltas/runs as-is -- no
   // separate decode-then-reencode step.
   try {
-    return Label::from_deltas(std::move(deltas), std::move(distances), n);
+    return Label::from_runs(std::move(deltas), std::move(run_values),
+                            std::move(run_lengths), n);
   } catch (const std::runtime_error&) {
+    throw std::runtime_error("Invalid label in RXL index");
+  } catch (const std::invalid_argument&) {
     throw std::runtime_error("Invalid label in RXL index");
   }
 }
@@ -197,13 +227,14 @@ void IndexIO::export_binary(const LabelingResult& result,
   std::ofstream out(path, std::ios::binary);
   if (!out) throw std::runtime_error("Cannot open export file: " + path);
   out.write("RXLIDX\0\1", 8);
-  write_u32(out, 2);
+  // Version 3: distances are run-length encoded (delta_label.h); versions
+  // 1-2's flat per-entry distance layout is no longer written or read.
+  write_u32(out, 3);
   write_u32(out, static_cast<std::uint32_t>(n));
-  // Bit 0: rank_reordered (unchanged). Bit 1: varint encoding, added here.
-  // A reader that has never heard of bit 1 already rejects any file that
-  // sets it (see the `flags & ~1u` check that predates this feature), so
-  // old files -- bit 1 always clear -- round-trip through this format
-  // exactly as they always have, byte for byte.
+  // Bit 0: rank_reordered. Bit 1: varint hub-id/run-value encoding (vs.
+  // TwoBlockDelta). Both flags are scoped to a single version-3 file; the
+  // version bump above is what actually separates this format (run-length
+  // encoded distances) from the older flat per-entry one, not these bits.
   write_u32(out, (result.rank_reordered ? 1u : 0u) | (varint ? 2u : 0u));
   if (!varint) write_u8(out, static_cast<std::uint8_t>(distance_width));
   for (auto v : result.rank_to_vertex) write_u32(out, v);
@@ -221,7 +252,7 @@ LabelingResult IndexIO::import_binary(const std::string& path) {
   in.read(magic.data(), 8);
   if (!in || std::string(magic.data(), 8) != std::string("RXLIDX\0\1", 8))
     throw std::runtime_error("Not an RXL index");
-  if (read_u32(in) != 2)
+  if (read_u32(in) != 3)
     throw std::runtime_error("Unsupported RXL index version");
   const std::size_t n = read_u32(in);
   LabelingResult result;
