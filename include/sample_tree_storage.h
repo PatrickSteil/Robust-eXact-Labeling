@@ -19,7 +19,18 @@ class DenseBufferPool {
     std::vector<std::vector<VertexId>> children;
     std::vector<std::uint8_t> alive;
     std::vector<Score> subtree;
+    std::vector<VertexId> touched;
   };
+
+  static void clear_touched(Buffers& buf) {
+    for (const VertexId v : buf.touched) {
+      buf.parent[v] = kInvalidVertex;
+      buf.alive[v] = 0;
+      buf.subtree[v] = 0;
+      buf.children[v].clear();
+    }
+    buf.touched.clear();
+  }
 
   std::unique_ptr<Buffers> acquire(std::size_t n) {
     std::unique_ptr<Buffers> buf;
@@ -32,15 +43,13 @@ class DenseBufferPool {
     }
     if (!buf) buf = std::make_unique<Buffers>();
     if (buf->parent.size() == n) {
-      std::fill(buf->parent.begin(), buf->parent.end(), kInvalidVertex);
-      std::fill(buf->alive.begin(), buf->alive.end(), 0);
-      std::fill(buf->subtree.begin(), buf->subtree.end(), 0);
-      for (auto& children : buf->children) children.clear();
+      clear_touched(*buf);
     } else {
       buf->parent.assign(n, kInvalidVertex);
       buf->children.assign(n, {});
       buf->alive.assign(n, 0);
       buf->subtree.assign(n, 0);
+      buf->touched.clear();
     }
     return buf;
   }
@@ -88,10 +97,7 @@ class SampleTreeStorage {
     is_dense_ = true;
     pool_ = &pool;
     if (dense_ && dense_->parent.size() == n_) {
-      std::fill(dense_->parent.begin(), dense_->parent.end(), kInvalidVertex);
-      std::fill(dense_->alive.begin(), dense_->alive.end(), 0);
-      std::fill(dense_->subtree.begin(), dense_->subtree.end(), 0);
-      for (auto& children : dense_->children) children.clear();
+      DenseBufferPool::clear_touched(*dense_);
     } else {
       dense_ = pool.acquire(n_);
     }
@@ -119,36 +125,45 @@ class SampleTreeStorage {
   }
 
   void set_parent(VertexId v, VertexId parent) {
-    if (is_dense_)
+    if (is_dense_) {
       dense_->parent[v] = parent;
-    else
+      dense_->touched.push_back(v);
+    } else {
       sparse_[v].parent = parent;
+    }
   }
   void mark_alive(VertexId v) {
-    if (is_dense_)
+    if (is_dense_) {
       dense_->alive[v] = 1;
-    else
+      dense_->touched.push_back(v);
+    } else {
       (void)sparse_[v];  // Ensures a node exists, parent already set above.
+    }
   }
   void set_subtree(VertexId v, Score value) {
-    if (is_dense_)
+    if (is_dense_) {
       dense_->subtree[v] = value;
-    else
+      dense_->touched.push_back(v);
+    } else {
       sparse_[v].subtree = value;
+    }
   }
   void add_subtree(VertexId v, Score delta) {
     if (is_dense_) {
       dense_->subtree[v] += delta;
+      dense_->touched.push_back(v);
     } else {
       const auto it = sparse_.find(v);
       if (it != sparse_.end()) it->second.subtree += delta;
     }
   }
   void add_child(VertexId parent, VertexId child) {
-    if (is_dense_)
+    if (is_dense_) {
       dense_->children[parent].push_back(child);
-    else
+      dense_->touched.push_back(parent);
+    } else {
       sparse_[parent].children.push_back(child);
+    }
   }
   void deactivate(VertexId v) {
     if (is_dense_)
