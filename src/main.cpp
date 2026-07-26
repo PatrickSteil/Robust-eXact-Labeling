@@ -1,5 +1,4 @@
 #include <atomic>
-#include <cctype>
 #include <chrono>
 #include <exception>
 #include <filesystem>
@@ -9,6 +8,7 @@
 #include <system_error>
 #include <thread>
 
+#include "cmdparser.hpp"
 #include "graph.h"
 #include "index_io.h"
 #include "parallel_for.h"
@@ -17,43 +17,75 @@
 #include "statistics.h"
 using namespace rxl;
 namespace {
-void usage(const char* program) {
-  std::cerr
-      << "Usage: " << program
-      << " [graph] [options]\n"
-         "  --export <file>   export labels/rank maps to a binary RXL index\n"
-         "  --label-encoding <two-block|varint>\n"
-         "                    on-disk hub-id/distance byte packing used by "
-         "--export\n"
-         "                    (default: two-block). two-block is the "
-         "paper's fixed\n"
-         "                    1-byte/4-byte split (Section 4.1); varint "
-         "packs every\n"
-         "                    value as a LEB128 varint (7 payload bits per "
-         "byte, top\n"
-         "                    bit set to mean \"one more byte follows\"), "
-         "often\n"
-         "                    smaller but slower to decode. Ignored "
-         "without --export.\n"
-         "  --import <file>   load labels/rank maps from a binary RXL index\n"
-         "                    instead of building them (graph argument then\n"
-         "                    becomes optional)\n"
-         "  --benchmark [n]   run n (default 10000) random vertex-to-vertex\n"
-         "                    queries and report the average query runtime "
-         "and\n"
-         "                    the number of reachable (found) pairs\n"
-         "  --verbose         print graph, sampling, and label statistics\n"
-         "  --threads <n>     parallel sample-tree workers (default: 1)\n"
-         "  --seed <n>        seed for the query benchmark (default: 42)\n"
-         "  --degree          use degree ordering instead of SamPG\n"
-         "  --no-reorder      keep original internal zero-based IDs\n";
-}
-bool is_number(const std::string& s) {
-  if (s.empty()) return false;
-  for (char c : s)
-    if (!std::isdigit(static_cast<unsigned char>(c))) return false;
-  return true;
-}
+
+constexpr char kGeneralHelp[] =
+    "Usage: rxl_app [graph] [options]\n"
+    "  [graph]           path to the input graph file (see --format); "
+    "optional\n"
+    "                    only when --import is given.\n"
+    "\n"
+    "  --format, -f      input graph file format: dimacs (default), snap, "
+    "metis,\n"
+    "                    or csv. dimacs expects the DIMACS 'p sp'/'a' "
+    "shortest-path\n"
+    "                    format; snap expects SNAP-style 'from to "
+    "[weight]' edge\n"
+    "                    lists; metis expects the METIS 'n m [fmt]' "
+    "adjacency\n"
+    "                    format; csv expects 'from,to,weight' lines "
+    "(weight\n"
+    "                    optional, an optional header row is skipped).\n"
+    "  --export, -e      export labels/rank maps to a binary RXL index\n"
+    "  --label-encoding, -l  <two-block|varint>\n"
+    "                    on-disk hub-id/distance byte packing used by "
+    "--export\n"
+    "                    (default: two-block). two-block is the paper's "
+    "fixed\n"
+    "                    1-byte/4-byte split (Section 4.1); varint packs "
+    "every\n"
+    "                    value as a LEB128 varint (7 payload bits per "
+    "byte, top\n"
+    "                    bit set to mean \"one more byte follows\"), "
+    "often\n"
+    "                    smaller but slower to decode. Ignored without "
+    "--export.\n"
+    "  --import, -i      load labels/rank maps from a binary RXL index "
+    "instead\n"
+    "                    of building them (graph argument then becomes "
+    "optional)\n"
+    "  --benchmark, -b   run a benchmark of random vertex-to-vertex "
+    "queries and\n"
+    "                    report the average query runtime and the number "
+    "of\n"
+    "                    reachable (found) pairs\n"
+    "  --benchmark-queries, -q  <n>\n"
+    "                    number of queries to run with --benchmark "
+    "(default: 10000)\n"
+    "  --verbose, -v     print graph, sampling, and label statistics\n"
+    "  --threads, -t     parallel sample-tree workers (default: 1)\n"
+    "  --seed, -s        seed for the query benchmark (default: 42)\n"
+    "  --degree, -d      use degree ordering instead of SamPG\n"
+    "  --no-reorder, -r  keep original internal zero-based IDs\n"
+    "  --max-live-trees, -x  <n>\n"
+    "                    cap on concurrently live SamPG sample trees "
+    "(default:\n"
+    "                    1024); every rank pays an O(live trees) cost, so "
+    "this\n"
+    "                    bounds how much a run can slow down on graphs "
+    "where\n"
+    "                    pruning makes trees cheap to build\n"
+    "  --min-tree-vertices, -m  <n>\n"
+    "                    force-retire a sample tree once it has shrunk to "
+    "at\n"
+    "                    most this many remaining vertices, instead of "
+    "waiting\n"
+    "                    for it to reach 0 on its own (default: 8; use 0 "
+    "to\n"
+    "                    disable)\n"
+    "\n"
+    "Note: the positional [graph] path, if given, must come before any "
+    "-- options.";
+
 void print_graph_statistics(const Graph& graph) {
   const auto s = compute_graph_statistics(graph);
   std::cout << "Graph: vertices=" << s.vertices << ", arcs=" << s.arcs
@@ -100,66 +132,90 @@ void run_benchmark(const HubLabels& labels, std::size_t num_queries,
 }  // namespace
 int main(int argc, char** argv) {
   if (argc < 2) {
-    usage(argv[0]);
+    std::cerr << kGeneralHelp << '\n';
     return 1;
   }
   try {
-    bool degree = false, reorder = true, verbose = false, do_benchmark = false;
-    std::string export_path, import_path;
-    std::size_t threads = 1, benchmark_queries = 10000;
-    int seed = 42;
-    LabelEncoding encoding = LabelEncoding::TwoBlockDelta;
-    std::vector<std::string> positional;
-    for (int i = 1; i < argc; ++i) {
-      const std::string arg = argv[i];
-      if (arg == "--degree")
-        degree = true;
-      else if (arg == "--no-reorder")
-        reorder = false;
-      else if (arg == "--verbose")
-        verbose = true;
-      else if (arg == "--export") {
-        if (++i >= argc) throw std::invalid_argument("--export needs a path");
-        export_path = argv[i];
-      } else if (arg == "--import") {
-        if (++i >= argc) throw std::invalid_argument("--import needs a path");
-        import_path = argv[i];
-      } else if (arg == "--label-encoding") {
-        if (++i >= argc)
-          throw std::invalid_argument("--label-encoding needs a value");
-        const std::string value = argv[i];
-        if (value == "two-block")
-          encoding = LabelEncoding::TwoBlockDelta;
-        else if (value == "varint")
-          encoding = LabelEncoding::Varint;
-        else
-          throw std::invalid_argument(
-              "--label-encoding must be 'two-block' or 'varint', got: " +
-              value);
-      } else if (arg == "--threads") {
-        if (++i >= argc) throw std::invalid_argument("--threads needs a count");
-        threads = std::stoull(argv[i]);
-        if (!threads)
-          throw std::invalid_argument("thread count must be positive");
-      } else if (arg == "--benchmark") {
-        do_benchmark = true;
-        benchmark_queries = 10000;
-        if (i + 1 < argc && is_number(argv[i + 1]))
-          benchmark_queries = std::stoull(argv[++i]);
-        if (!benchmark_queries)
-          throw std::invalid_argument("benchmark query count must be positive");
-      } else if (arg == "--seed") {
-        if (i + 1 < argc && is_number(argv[i + 1]))
-          seed = std::stoi(argv[++i]);
-        else
-          throw std::invalid_argument("--seed needs an integer");
-      } else if (!arg.empty() && arg[0] == '-')
-        throw std::invalid_argument("unknown option: " + arg);
-      else
-        positional.push_back(arg);
-    }
-    if (positional.size() > 1)
-      throw std::invalid_argument("provide at most one graph file");
+    cli::Parser parser(argc, argv, kGeneralHelp);
+    parser.set_default<std::string>(
+        false, "Input graph file (see --format); optional only with --import",
+        "");
+    parser.set_optional<std::string>(
+        "f", "format", "dimacs",
+        "Input graph file format: dimacs, snap, metis, or csv");
+    parser.set_optional<std::string>("e", "export", "",
+                                     "Export labels/rank maps to a binary "
+                                     "RXL index");
+    parser.set_optional<std::string>(
+        "l", "label-encoding", "two-block",
+        "On-disk hub-id/distance byte packing used by --export "
+        "(two-block|varint)");
+    parser.set_optional<std::string>(
+        "i", "import", "",
+        "Load labels/rank maps from a binary RXL index instead of "
+        "building them");
+    parser.set_optional<bool>(
+        "b", "benchmark", false,
+        "Run a benchmark of random vertex-to-vertex queries");
+    parser.set_optional<unsigned long long>(
+        "q", "benchmark-queries", 10000,
+        "Number of queries to run with --benchmark");
+    parser.set_optional<bool>("v", "verbose", false,
+                              "Print graph, sampling, and label statistics");
+    parser.set_optional<unsigned long long>("t", "threads", 1,
+                                            "Parallel sample-tree workers");
+    parser.set_optional<int>("s", "seed", 42, "Seed for the query benchmark");
+    parser.set_optional<bool>("d", "degree", false,
+                              "Use degree ordering instead of SamPG");
+    parser.set_optional<bool>("r", "no-reorder", false,
+                              "Keep original internal zero-based IDs");
+    parser.set_optional<unsigned long long>(
+        "x", "max-live-trees", 1024,
+        "Cap on concurrently live SamPG sample trees");
+    parser.set_optional<unsigned long long>(
+        "m", "min-tree-vertices", 8,
+        "Force-retire a sample tree once it has shrunk to at most this "
+        "many remaining vertices (0 disables early retirement)");
+
+    if (!parser.run()) return 1;
+
+    const std::string positional = parser.get_default<std::string>();
+    const std::string format_name = parser.get<std::string>("f");
+    const std::string export_path = parser.get<std::string>("e");
+    const std::string label_encoding_name = parser.get<std::string>("l");
+    const std::string import_path = parser.get<std::string>("i");
+    const bool do_benchmark = parser.get<bool>("b");
+    const std::size_t benchmark_queries =
+        static_cast<std::size_t>(parser.get<unsigned long long>("q"));
+    const bool verbose = parser.get<bool>("v");
+    const std::size_t threads =
+        static_cast<std::size_t>(parser.get<unsigned long long>("t"));
+    const int seed = parser.get<int>("s");
+    const bool degree = parser.get<bool>("d");
+    const bool reorder = !parser.get<bool>("r");
+    const std::size_t max_live_trees =
+        static_cast<std::size_t>(parser.get<unsigned long long>("x"));
+    const std::size_t min_tree_vertices =
+        static_cast<std::size_t>(parser.get<unsigned long long>("m"));
+
+    if (!benchmark_queries)
+      throw std::invalid_argument("--benchmark-queries must be positive");
+    if (!threads) throw std::invalid_argument("--threads must be positive");
+    if (!max_live_trees)
+      throw std::invalid_argument("--max-live-trees must be positive");
+
+    const GraphFormat format = parse_graph_format(format_name);
+
+    LabelEncoding encoding;
+    if (label_encoding_name == "two-block")
+      encoding = LabelEncoding::TwoBlockDelta;
+    else if (label_encoding_name == "varint")
+      encoding = LabelEncoding::Varint;
+    else
+      throw std::invalid_argument(
+          "--label-encoding must be 'two-block' or 'varint', got: " +
+          label_encoding_name);
+
     if (positional.empty() && import_path.empty())
       throw std::invalid_argument(
           "provide a graph file (or --import a saved index)");
@@ -168,18 +224,21 @@ int main(int argc, char** argv) {
     if (!import_path.empty()) {
       result = IndexIO::import_binary(import_path);
       if (verbose) {
-        if (!positional.empty()) print_graph_statistics(Graph(positional[0]));
+        if (!positional.empty())
+          print_graph_statistics(Graph(positional, format));
         std::cout << "Imported index from " << import_path
                   << ", vertices=" << result.labels.size()
                   << ", rank-reordered="
                   << (result.rank_reordered ? "yes" : "no") << '\n';
       }
     } else {
-      Graph graph(positional[0]);
+      Graph graph(positional, format);
       if (verbose) print_graph_statistics(graph);
       SamplingOptions options;
       options.num_threads = threads;
       options.verbose = verbose;
+      options.max_live_trees = max_live_trees;
+      options.min_tree_vertices = min_tree_vertices;
       result = degree ? PrunedLabeling::compute_with_degree_order(graph)
                       : PrunedLabeling::compute(graph, options);
       if (reorder) {

@@ -1,12 +1,72 @@
 #include "graph.h"
 
+#include <algorithm>
+#include <array>
+#include <charconv>
 #include <fstream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace rxl {
-Graph::Graph(const std::string& file) {
+namespace {
+// Splits a line on any of `delimiters`, dropping empty fields (so repeated
+// whitespace is collapsed the way operator>> on a stream would do).
+std::vector<std::string> split(const std::string& line, const char* delimiters) {
+  std::vector<std::string> fields;
+  std::size_t pos = 0;
+  while (pos < line.size()) {
+    std::size_t next = line.find_first_of(delimiters, pos);
+    if (next == std::string::npos) next = line.size();
+    if (next > pos) fields.push_back(line.substr(pos, next - pos));
+    pos = next + 1;
+  }
+  return fields;
+}
+
+std::uint64_t parse_uint(const std::string& field, const std::string& context) {
+  std::uint64_t value = 0;
+  const auto* begin = field.data();
+  const auto* end = field.data() + field.size();
+  const auto result = std::from_chars(begin, end, value);
+  if (result.ec != std::errc() || result.ptr != end)
+    throw std::runtime_error("Malformed integer in " + context + ": " + field);
+  return value;
+}
+}  // namespace
+
+GraphFormat parse_graph_format(const std::string& name) {
+  if (name == "dimacs") return GraphFormat::Dimacs;
+  if (name == "snap") return GraphFormat::Snap;
+  if (name == "metis") return GraphFormat::Metis;
+  if (name == "csv" || name == "edgelist" || name == "edge-list")
+    return GraphFormat::EdgeList;
+  throw std::invalid_argument(
+      "Unknown graph format '" + name +
+      "' (expected: dimacs, snap, metis, csv)");
+}
+
+Graph::Graph(const std::string& file, GraphFormat format) {
+  switch (format) {
+    case GraphFormat::Dimacs:
+      load_dimacs(file);
+      break;
+    case GraphFormat::Snap:
+      load_snap(file);
+      break;
+    case GraphFormat::Metis:
+      load_metis(file);
+      break;
+    case GraphFormat::EdgeList:
+      load_edge_list(file);
+      break;
+  }
+  build_reverse();
+  update_weighted_flag();
+}
+
+void Graph::load_dimacs(const std::string& file) {
   std::ifstream input(file);
   if (!input) throw std::runtime_error("Could not open file: " + file);
   std::string line;
@@ -40,8 +100,163 @@ Graph::Graph(const std::string& file) {
     }
   }
   if (!saw_problem) throw std::runtime_error("DIMACS file has no problem line");
-  build_reverse();
-  update_weighted_flag();
+}
+
+// SNAP edge lists (https://snap.stanford.edu/data/) list one directed edge
+// per line as whitespace-separated "from to [weight]", with '#'-prefixed
+// comment/header lines. Vertex IDs are arbitrary 64-bit integers that need
+// not be contiguous or start at 0, so IDs are compacted on the fly in the
+// order they're first seen.
+void Graph::load_snap(const std::string& file) {
+  std::ifstream input(file);
+  if (!input) throw std::runtime_error("Could not open file: " + file);
+  std::unordered_map<std::uint64_t, VertexId> id_map;
+  std::vector<std::array<std::uint64_t, 3>> raw_edges;  // from, to, weight
+  auto intern = [&](std::uint64_t raw) -> VertexId {
+    auto [it, inserted] = id_map.try_emplace(raw, static_cast<VertexId>(id_map.size()));
+    if (inserted && id_map.size() - 1 > kInvalidVertex)
+      throw std::runtime_error("SNAP file has too many distinct vertex IDs");
+    return it->second;
+  };
+  std::string line;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty() || line[0] == '#') continue;
+    const auto fields = split(line, " \t");
+    if (fields.size() != 2 && fields.size() != 3)
+      throw std::runtime_error("Malformed SNAP edge line: " + line);
+    const std::uint64_t from = parse_uint(fields[0], "SNAP edge");
+    const std::uint64_t to = parse_uint(fields[1], "SNAP edge");
+    const std::uint64_t weight =
+        fields.size() == 3 ? parse_uint(fields[2], "SNAP edge weight") : 1;
+    if (weight == 0 || weight >= kInfinity)
+      throw std::runtime_error("SNAP edge weight out of range: " + line);
+    raw_edges.push_back({from, to, weight});
+    intern(from);
+    intern(to);
+  }
+  adjacency_.assign(id_map.size(), {});
+  for (const auto& [from, to, weight] : raw_edges)
+    adjacency_[id_map.at(from)].emplace_back(id_map.at(to),
+                                             static_cast<Distance>(weight));
+}
+
+// METIS graph format (https://github.com/KarypisLab/METIS manual, Section
+// 5): a header line "n m [fmt]" (fmt's ones digit is 1 if edges carry
+// weights) followed by exactly n lines, one per 1-based vertex, each
+// listing that vertex's neighbors (and, if weighted, an interleaved weight
+// after every neighbor). '%'-prefixed lines are comments. Since METIS
+// stores undirected graphs by listing each edge in both endpoints' lines,
+// parsing every vertex line as a set of outgoing arcs naturally reproduces
+// both directions.
+void Graph::load_metis(const std::string& file) {
+  std::ifstream input(file);
+  if (!input) throw std::runtime_error("Could not open file: " + file);
+  std::string line;
+  std::uint64_t n = 0, m = 0;
+  int fmt = 0;
+  bool saw_header = false;
+  std::uint64_t vertex = 0;  // 0-based count of adjacency lines consumed
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty() || line[0] == '%') continue;
+    if (!saw_header) {
+      const auto fields = split(line, " \t");
+      if (fields.size() < 2)
+        throw std::runtime_error("Malformed METIS header line: " + line);
+      n = parse_uint(fields[0], "METIS header");
+      m = parse_uint(fields[1], "METIS header");
+      if (n > kInvalidVertex)
+        throw std::runtime_error("METIS graph has too many vertices");
+      if (fields.size() >= 3) fmt = static_cast<int>(parse_uint(fields[2], "METIS header"));
+      if (fmt != 0 && fmt != 1)
+        throw std::runtime_error(
+            "Unsupported METIS fmt (only unweighted '0' or edge-weighted "
+            "'1' are supported): " + fields[2]);
+      adjacency_.assign(static_cast<std::size_t>(n), {});
+      saw_header = true;
+      continue;
+    }
+    if (vertex >= n)
+      throw std::runtime_error(
+          "METIS file has more adjacency lines than its header declares");
+    const bool weighted = fmt == 1;
+    const auto fields = split(line, " \t");
+    if (weighted && fields.size() % 2 != 0)
+      throw std::runtime_error(
+          "Malformed METIS weighted adjacency line: " + line);
+    for (std::size_t i = 0; i < fields.size(); i += weighted ? 2 : 1) {
+      const std::uint64_t to = parse_uint(fields[i], "METIS adjacency line");
+      const std::uint64_t weight =
+          weighted ? parse_uint(fields[i + 1], "METIS adjacency line") : 1;
+      if (to == 0 || to > n || weight == 0 || weight >= kInfinity)
+        throw std::runtime_error("Malformed METIS neighbor: " + line);
+      adjacency_[static_cast<VertexId>(vertex)].emplace_back(
+          static_cast<VertexId>(to - 1), static_cast<Distance>(weight));
+    }
+    ++vertex;
+  }
+  if (!saw_header) throw std::runtime_error("METIS file has no header line");
+  if (vertex != n)
+    throw std::runtime_error(
+        "METIS file has fewer adjacency lines than its header declares");
+  (void)m;  // m (declared arc count) isn't cross-checked against the body.
+}
+
+// Simple "from,to[,weight]" CSV edge list (weight optional, defaults to 1).
+// An optional non-numeric header row ("from,to,weight") is skipped. As with
+// SNAP, vertex IDs are arbitrary integers and get compacted on the fly.
+void Graph::load_edge_list(const std::string& file) {
+  std::ifstream input(file);
+  if (!input) throw std::runtime_error("Could not open file: " + file);
+  std::unordered_map<std::uint64_t, VertexId> id_map;
+  std::vector<std::array<std::uint64_t, 3>> raw_edges;
+  auto intern = [&](std::uint64_t raw) -> VertexId {
+    auto [it, inserted] = id_map.try_emplace(raw, static_cast<VertexId>(id_map.size()));
+    if (inserted && id_map.size() - 1 > kInvalidVertex)
+      throw std::runtime_error("CSV file has too many distinct vertex IDs");
+    return it->second;
+  };
+  std::string line;
+  bool first_line = true;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty() || line[0] == '#') continue;
+    auto fields = split(line, ",");
+    // Trim surrounding whitespace from each field so "from, to, weight"
+    // (with spaces after the commas) parses the same as "from,to,weight".
+    for (auto& field : fields) {
+      const auto begin = field.find_first_not_of(" \t");
+      const auto end = field.find_last_not_of(" \t");
+      field = begin == std::string::npos ? "" : field.substr(begin, end - begin + 1);
+    }
+    if (first_line) {
+      first_line = false;
+      // A header like "from,to,weight" has non-numeric fields; skip it.
+      std::uint64_t discard = 0;
+      const bool numeric =
+          !fields.empty() &&
+          std::from_chars(fields[0].data(), fields[0].data() + fields[0].size(),
+                          discard)
+                  .ec == std::errc();
+      if (!numeric) continue;
+    }
+    if (fields.size() != 2 && fields.size() != 3)
+      throw std::runtime_error("Malformed CSV edge line: " + line);
+    const std::uint64_t from = parse_uint(fields[0], "CSV edge");
+    const std::uint64_t to = parse_uint(fields[1], "CSV edge");
+    const std::uint64_t weight =
+        fields.size() == 3 ? parse_uint(fields[2], "CSV edge weight") : 1;
+    if (weight == 0 || weight >= kInfinity)
+      throw std::runtime_error("CSV edge weight out of range: " + line);
+    raw_edges.push_back({from, to, weight});
+    intern(from);
+    intern(to);
+  }
+  adjacency_.assign(id_map.size(), {});
+  for (const auto& [from, to, weight] : raw_edges)
+    adjacency_[id_map.at(from)].emplace_back(id_map.at(to),
+                                             static_cast<Distance>(weight));
 }
 
 Graph::Graph(AdjacencyList adjacency, AdjacencyList reverse)

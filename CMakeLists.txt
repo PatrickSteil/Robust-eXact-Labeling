@@ -18,6 +18,9 @@ target_link_libraries(rxl PUBLIC Threads::Threads)
 target_compile_options(rxl PRIVATE $<$<CXX_COMPILER_ID:GNU,Clang>:-Wall;-Wextra;-Wpedantic>)
 add_executable(rxl_app src/main.cpp)
 target_link_libraries(rxl_app PRIVATE rxl)
+# Vendored CmdParser (see third_party/cmdparser/cmdparser.hpp), used only by
+# main.cpp's CLI handling -- PRIVATE since it's not part of the rxl library.
+target_include_directories(rxl_app PRIVATE third_party/cmdparser)
 include(CTest)
 if(BUILD_TESTING)
   add_executable(rxl_tests tests/test_main.cpp)

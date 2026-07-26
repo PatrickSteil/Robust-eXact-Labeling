@@ -216,6 +216,37 @@ std::size_t remove_subtree(SampleTree& tree, VertexId hub,
   return static_cast<std::size_t>(removed);
 }
 
+// Once a tree has shrunk to a handful of remaining vertices, its odds of
+// ever hitting exactly 0 (which is the only thing that lets the ranking
+// loop below actually drop it from `trees`) can be very poor: reaching 0
+// requires every one of its surviving vertices to eventually be selected
+// as a hub, which for a straggling fragment may not happen for a very long
+// time. Meanwhile every *other* live tree pays a fixed O(1) tax for that
+// fragment's continued existence every single rank (the remove_subtree
+// sweep in sampled_order() below), so a large population of such stragglers
+// turns each rank's bookkeeping into O(live trees) work that keeps growing
+// instead of staying roughly proportional to `buckets`. This forces a
+// shrunk tree fully empty -- as if every surviving vertex had just been
+// selected as a hub, via the exact same remove_subtree() used for that --
+// so it becomes eligible for the ordinary retirement sweep this same rank,
+// instead of lingering indefinitely. `tree.members` is the tree's original
+// (fixed, from construction) settle list, so this is O(that tree's own
+// size), paid once, when it's evicted -- not on every subsequent rank.
+void retire_remaining(SampleTree& tree,
+                      std::vector<std::vector<Score>>& counters,
+                      std::size_t& live_vertices) {
+  for (VertexId v : tree.members) {
+    if (!tree.storage.alive(v)) continue;
+    const VertexId parent = tree.storage.parent_of(v);
+    // Skip anything whose parent is still alive: it'll be swept up when its
+    // (still-alive) ancestor's fragment is removed below, so removing it
+    // here too would double-subtract its contribution from `counters`.
+    if (parent != kInvalidVertex && tree.storage.alive(parent)) continue;
+    bool downgraded = false;
+    live_vertices -= remove_subtree(tree, v, counters, downgraded);
+  }
+}
+
 std::pair<Score, Score> priority(const std::vector<Score>& counter,
                                  std::size_t discard,
                                  std::vector<Score>& scratch) {
@@ -294,12 +325,10 @@ std::vector<VertexId> sampled_order(const Graph& graph,
         const std::size_t bucket = (first_bucket + i) % buckets;
         TreeScratch& lane = scratch_pool[i];
         SampleTree& tree = lane_trees[i];
-        futures.emplace_back(
-            std::async(std::launch::async, [&graph, &labels, &lane, &tree,
-                                            root, bucket] {
+        futures.emplace_back(std::async(
+            std::launch::async, [&graph, &labels, &lane, &tree, root, bucket] {
               std::uint64_t work = 0;
-              build_sample_tree(graph, root, labels, bucket, work, lane,
-                                tree);
+              build_sample_tree(graph, root, labels, bucket, work, lane, tree);
               return work;
             }));
       }
@@ -372,6 +401,11 @@ std::vector<VertexId> sampled_order(const Graph& graph,
       bool downgraded = false;
       live_vertices -= remove_subtree(tree, best, counters, downgraded);
       if (downgraded) ++stats.sparse_downgrades;
+      // See retire_remaining()'s comment: don't let a tree that has
+      // dwindled to a few stragglers stick around indefinitely just
+      // because none of its survivors happen to get selected next.
+      if (tree.remaining > 0 && tree.remaining <= options.min_tree_vertices)
+        retire_remaining(tree, counters, live_vertices);
     }
     trees.erase(std::remove_if(trees.begin(), trees.end(),
                                [&](SampleTree& tree) {
@@ -390,6 +424,7 @@ std::vector<VertexId> sampled_order(const Graph& graph,
 
     std::size_t attempts = 0;
     while ((trees.size() < buckets || tree_work <= label_work) &&
+           trees.size() < options.max_live_trees &&
            live_vertices < max_tree_vertices && attempts < 2 * n) {
       std::vector<VertexId> batch;
       batch.reserve(threads);
