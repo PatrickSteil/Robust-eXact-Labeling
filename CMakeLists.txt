@@ -11,6 +11,7 @@ find_package(Threads REQUIRED)
 add_library(rxl
   src/graph.cpp
   src/dijkstra.cpp
+  src/addressable_heap.cpp
   src/pruned_labeling.cpp
   src/query_support.cpp
   src/index_io.cpp
