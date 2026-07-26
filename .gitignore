@@ -1,3 +1,4 @@
 build/
+build-perf/
 build-debug/
 data/snap/*

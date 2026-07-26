@@ -6,7 +6,9 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <queue>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -179,18 +181,41 @@ void build_sample_tree(const Graph& graph, VertexId root,
   lookup_touched.clear();
 }
 
+// `touch(v)` is called for every vertex whose counters[v] just changed, so
+// the caller (sampled_order()) can keep its selection heap in sync (see the
+// HeapEntry/version machinery below). Templated on the callable type so
+// this stays a plain inline call in the hot path, not a std::function
+// indirection.
+template <class TouchFn>
 void add_tree_scores(const SampleTree& tree,
-                     std::vector<std::vector<Score>>& counters) {
+                     std::vector<std::vector<Score>>& counters,
+                     TouchFn&& touch) {
   for (VertexId v : tree.members) {
     if (tree.storage.alive(v)) {
       counters[v][tree.bucket] += tree.storage.subtree_of(v);
+      touch(v);
     }
   }
 }
 
+// Registers `tree` in the reverse index (Appendix A.2): for every vertex
+// still alive in it, record that this tree is one of the (usually few)
+// live trees currently containing that vertex. Called once, right after a
+// tree finishes growing (see grow_batch's built-processing loop below) --
+// not from inside build_sample_tree itself, since that runs concurrently
+// across lanes and two different trees could settle the same vertex in the
+// same batch, which would race on membership[v].
+void register_membership(SampleTree* tree,
+                         std::vector<std::vector<SampleTree*>>& membership) {
+  for (VertexId v : tree->members)
+    if (tree->storage.alive(v)) membership[v].push_back(tree);
+}
+
+template <class TouchFn>
 std::size_t remove_subtree(SampleTree& tree, VertexId hub,
                            std::vector<std::vector<Score>>& counters,
-                           bool& downgraded) {
+                           bool& downgraded, TouchFn&& touch,
+                           std::vector<std::vector<SampleTree*>>& membership) {
   downgraded = false;
   auto& storage = tree.storage;
   if (!storage.alive(hub)) return 0;
@@ -199,6 +224,7 @@ std::size_t remove_subtree(SampleTree& tree, VertexId hub,
   while (ancestor != kInvalidVertex && storage.alive(ancestor)) {
     counters[ancestor][tree.bucket] -= removed;
     storage.set_subtree(ancestor, storage.subtree_of(ancestor) - removed);
+    touch(ancestor);
     ancestor = storage.parent_of(ancestor);
   }
   std::vector<VertexId> stack{hub};
@@ -207,8 +233,21 @@ std::size_t remove_subtree(SampleTree& tree, VertexId hub,
     stack.pop_back();
     if (!storage.alive(v)) continue;
     counters[v][tree.bucket] -= storage.subtree_of(v);
+    touch(v);
     const std::vector<VertexId> children = storage.children_of(v);
     storage.deactivate(v);
+    // v is no longer alive in `tree`: drop it from the reverse index.
+    // membership[v] is short (bounded by how many live trees currently
+    // contain v), so a linear swap-and-pop is cheap and avoids pulling in
+    // a set/hash-set just for this.
+    auto& lst = membership[v];
+    for (std::size_t i = 0; i < lst.size(); ++i) {
+      if (lst[i] == &tree) {
+        lst[i] = lst.back();
+        lst.pop_back();
+        break;
+      }
+    }
     for (VertexId child : children) stack.push_back(child);
   }
   tree.remaining -= static_cast<std::size_t>(removed);
@@ -232,9 +271,11 @@ std::size_t remove_subtree(SampleTree& tree, VertexId hub,
 // instead of lingering indefinitely. `tree.members` is the tree's original
 // (fixed, from construction) settle list, so this is O(that tree's own
 // size), paid once, when it's evicted -- not on every subsequent rank.
+template <class TouchFn>
 void retire_remaining(SampleTree& tree,
                       std::vector<std::vector<Score>>& counters,
-                      std::size_t& live_vertices) {
+                      std::size_t& live_vertices, TouchFn&& touch,
+                      std::vector<std::vector<SampleTree*>>& membership) {
   for (VertexId v : tree.members) {
     if (!tree.storage.alive(v)) continue;
     const VertexId parent = tree.storage.parent_of(v);
@@ -243,7 +284,8 @@ void retire_remaining(SampleTree& tree,
     // here too would double-subtract its contribution from `counters`.
     if (parent != kInvalidVertex && tree.storage.alive(parent)) continue;
     bool downgraded = false;
-    live_vertices -= remove_subtree(tree, v, counters, downgraded);
+    live_vertices -=
+        remove_subtree(tree, v, counters, downgraded, touch, membership);
   }
 }
 
@@ -259,6 +301,44 @@ std::pair<Score, Score> priority(const std::vector<Score>& counter,
   return {robust, total};
 }
 
+// Lazy max-heap entry for vertex selection (Appendix A.2). Replaces the
+// original O(n)-per-rank rescan ("for v in 0..n, if not selected, compute
+// priority(v)") -- which makes the whole ordering algorithm O(n^2) and is
+// the actual reason large inputs are impractical -- with an O(log n) push
+// per counter update and an amortized O(log n) pop per rank.
+//
+// A vertex's priority can both increase (a new sampled tree adds to its
+// counters) and decrease (an existing tree's subtree is removed), so this
+// can't use the simple "priorities only decrease" lazy-deletion trick from
+// Dijkstra's algorithm. Instead every counter change pushes a brand new
+// entry stamped with the vertex's current version (see `touch()` in
+// sampled_order()); an entry is valid exactly when its stamped version
+// still matches the vertex's current version. Since the *last* push for any
+// vertex always carries its true current priority, popping the heap in
+// priority order and discarding stale (mismatched-version) or already-
+// selected entries always yields the same "best remaining vertex" the
+// original linear scan would have found -- with the same tie-break order:
+// higher (robust, total) priority first, then higher static degree, then
+// (to match the original scan's left-to-right, first-wins behavior on a
+// full tie) smaller vertex id.
+struct HeapEntry {
+  Score robust;
+  Score total;
+  std::size_t degree;
+  std::uint32_t version;
+  VertexId v;
+};
+struct HeapEntryLess {
+  bool operator()(const HeapEntry& a, const HeapEntry& b) const {
+    if (a.robust != b.robust) return a.robust < b.robust;
+    if (a.total != b.total) return a.total < b.total;
+    if (a.degree != b.degree) return a.degree < b.degree;
+    return a.v > b.v;  // smaller vertex id wins ties, so it must sort higher.
+  }
+};
+using SelectionHeap =
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, HeapEntryLess>;
+
 std::vector<VertexId> sampled_order(const Graph& graph,
                                     const SamplingOptions& options,
                                     HubLabels& labels, BuildStatistics& stats) {
@@ -271,7 +351,11 @@ std::vector<VertexId> sampled_order(const Graph& graph,
   std::iota(roots.begin(), roots.end(), VertexId{0});
   std::shuffle(roots.begin(), roots.end(), random);
 
-  std::vector<SampleTree> trees;
+  // Trees are held behind unique_ptr so their addresses stay stable while
+  // `trees` itself gets reordered/compacted (push_back, the erase-remove
+  // below) -- required for the reverse-index `membership` map just below to
+  // hold raw SampleTree* pointers safely across a tree's whole lifetime.
+  std::vector<std::unique_ptr<SampleTree>> trees;
   trees.reserve(initial + n / 8 + 1);
   // Retired trees (remaining == 0, see the erase-remove below) are parked
   // here instead of being destroyed, so growing a new tree can rewind one
@@ -280,32 +364,62 @@ std::vector<VertexId> sampled_order(const Graph& graph,
   // allocating its four O(n) dense arrays every single time a new sample
   // tree is grown (Section 3.3 / Appendix A.2: this happens repeatedly
   // throughout the run, not just for the `initial` trees).
-  std::vector<SampleTree> tree_pool;
-  auto acquire_tree = [&]() -> SampleTree {
+  std::vector<std::unique_ptr<SampleTree>> tree_pool;
+  auto acquire_tree = [&]() -> std::unique_ptr<SampleTree> {
     if (!tree_pool.empty()) {
-      SampleTree tree = std::move(tree_pool.back());
+      std::unique_ptr<SampleTree> tree = std::move(tree_pool.back());
       tree_pool.pop_back();
       return tree;
     }
-    return SampleTree(n);
+    return std::make_unique<SampleTree>(n);
   };
   std::vector<std::vector<Score>> counters(n, std::vector<Score>(buckets, 0));
+
+  // Reverse index (Appendix A.2): membership[v] lists the live trees that
+  // currently have v alive, so the ranking loop below can find "which live
+  // trees contain the vertex just picked as hub" directly, instead of
+  // probing every live tree each rank.
+  std::vector<std::vector<SampleTree*>> membership(n);
+
+  // A vertex's static degree is a fixed tie-breaker for selection (see
+  // priority()'s callers), so it's computed once here rather than
+  // recomputed for every unselected vertex on every rank, as the original
+  // O(n)-per-rank scan did.
+  std::vector<std::size_t> degree(n);
+  for (VertexId v = 0; v < n; ++v)
+    degree[v] =
+        graph.adjacency()[v].size() + graph.reverse_adjacency()[v].size();
+
+  // Selection heap (Appendix A.2): see HeapEntry's comment above. version[v]
+  // is bumped on every counters[v] change; touch(v) recomputes v's current
+  // priority and pushes a freshly-versioned entry. priority_scratch is
+  // shared scratch space for priority()'s internal sort.
+  std::vector<std::uint32_t> version(n, 0);
+  std::vector<Score> priority_scratch;
+  SelectionHeap heap;
+  auto touch = [&](VertexId v) {
+    ++version[v];
+    const auto p =
+        priority(counters[v], options.discarded_max_buckets, priority_scratch);
+    heap.push(HeapEntry{p.first, p.second, degree[v], version[v], v});
+  };
+
   std::uint64_t tree_work = 0, label_work = 0;
   const std::size_t threads = std::max<std::size_t>(1, options.num_threads);
   std::size_t live_vertices = 0;
   std::vector<TreeScratch> scratch_pool(threads);
   auto grow_batch = [&](const std::vector<VertexId>& batch_roots,
                         std::size_t first_bucket) {
-    using Built = std::pair<SampleTree, std::uint64_t>;
+    using Built = std::pair<std::unique_ptr<SampleTree>, std::uint64_t>;
     std::vector<Built> built;
     built.reserve(batch_roots.size());
     if (threads == 1 || batch_roots.size() == 1) {
       for (std::size_t i = 0; i < batch_roots.size(); ++i) {
         std::uint64_t work = 0;
-        SampleTree tree = acquire_tree();
+        std::unique_ptr<SampleTree> tree = acquire_tree();
         build_sample_tree(graph, batch_roots[i], labels,
                           (first_bucket + i) % buckets, work, scratch_pool[0],
-                          tree);
+                          *tree);
         built.emplace_back(std::move(tree), work);
       }
     } else {
@@ -314,7 +428,7 @@ std::vector<VertexId> sampled_order(const Graph& graph,
       // handed to that lane by reference -- each async task only ever
       // touches its own lane_trees[i], so there is no concurrent access to
       // the pool itself or to any other lane's tree.
-      std::vector<SampleTree> lane_trees;
+      std::vector<std::unique_ptr<SampleTree>> lane_trees;
       lane_trees.reserve(batch_roots.size());
       for (std::size_t i = 0; i < batch_roots.size(); ++i)
         lane_trees.push_back(acquire_tree());
@@ -324,13 +438,14 @@ std::vector<VertexId> sampled_order(const Graph& graph,
         const VertexId root = batch_roots[i];
         const std::size_t bucket = (first_bucket + i) % buckets;
         TreeScratch& lane = scratch_pool[i];
-        SampleTree& tree = lane_trees[i];
-        futures.emplace_back(std::async(
-            std::launch::async, [&graph, &labels, &lane, &tree, root, bucket] {
-              std::uint64_t work = 0;
-              build_sample_tree(graph, root, labels, bucket, work, lane, tree);
-              return work;
-            }));
+        SampleTree& tree_ref = *lane_trees[i];
+        futures.emplace_back(std::async(std::launch::async, [&graph, &labels,
+                                                             &lane, &tree_ref,
+                                                             root, bucket] {
+          std::uint64_t work = 0;
+          build_sample_tree(graph, root, labels, bucket, work, lane, tree_ref);
+          return work;
+        }));
       }
       for (std::size_t i = 0; i < futures.size(); ++i) {
         const std::uint64_t work = futures[i].get();
@@ -340,9 +455,10 @@ std::vector<VertexId> sampled_order(const Graph& graph,
     for (auto& item : built) {
       tree_work += item.second;
       stats.sampling_work += item.second;
-      add_tree_scores(item.first, counters);
-      live_vertices += item.first.remaining;
-      if (!item.first.storage.is_dense()) ++stats.sparse_downgrades;
+      add_tree_scores(*item.first, counters, touch);
+      register_membership(item.first.get(), membership);
+      live_vertices += item.first->remaining;
+      if (!item.first->storage.is_dense()) ++stats.sparse_downgrades;
       trees.push_back(std::move(item.first));
       ++stats.sampled_trees;
     }
@@ -355,13 +471,22 @@ std::vector<VertexId> sampled_order(const Graph& graph,
   }
   tree_work = 0;
 
+  // Seed the selection heap for every vertex the initial trees never
+  // touched (their counters are still all-zero, but they still need a
+  // valid, current heap entry to ever be selectable). Vertices the initial
+  // trees already touched via add_tree_scores()'s touch() calls above
+  // already have a live entry reflecting their real priority; re-touching
+  // them here would just be a harmless but wasted extra push, so skip them
+  // via the version check.
+  for (VertexId v = 0; v < n; ++v)
+    if (version[v] == 0) touch(v);
+
   std::vector<VertexId> order;
   order.reserve(n);
   std::vector<std::uint8_t> selected(n, 0);
   std::vector<Distance> root_out(n, kInfinity), root_in(n, kInfinity),
       distance(n, kInfinity);
   std::vector<VertexId> lookup_touched, search_touched;
-  std::vector<Score> priority_scratch;
   std::size_t next_root = initial;
   const std::size_t factor = 10 * std::max<std::size_t>(1, initial);
   const std::size_t max_tree_vertices =
@@ -370,22 +495,23 @@ std::vector<VertexId> sampled_order(const Graph& graph,
           : factor * n;
 
   for (std::size_t rank = 0; rank < n; ++rank) {
+    // Lazy max-heap pop (Appendix A.2) instead of an O(n) rescan: keep
+    // popping until we find an entry that is neither already selected nor
+    // stale (see HeapEntry's comment). Every vertex always has at least one
+    // valid entry in the heap until it's selected, so this always
+    // terminates with a valid `best` before the heap empties.
     VertexId best = kInvalidVertex;
-    std::pair<Score, Score> best_priority{0, 0};
-    std::size_t best_degree = 0;
-    for (VertexId v = 0; v < n; ++v)
-      if (!selected[v]) {
-        const auto p = priority(counters[v], options.discarded_max_buckets,
-                                priority_scratch);
-        const std::size_t degree =
-            graph.adjacency()[v].size() + graph.reverse_adjacency()[v].size();
-        if (best == kInvalidVertex || p > best_priority ||
-            (p == best_priority && degree > best_degree)) {
-          best = v;
-          best_priority = p;
-          best_degree = degree;
-        }
-      }
+    while (true) {
+      if (heap.empty())
+        throw std::logic_error(
+            "SamPG: selection heap exhausted before all vertices were "
+            "ranked");
+      const HeapEntry top = heap.top();
+      heap.pop();
+      if (selected[top.v] || top.version != version[top.v]) continue;
+      best = top.v;
+      break;
+    }
     selected[best] = 1;
     order.push_back(best);
     label_work +=
@@ -397,19 +523,36 @@ std::vector<VertexId> sampled_order(const Graph& graph,
       std::cerr << "[rxl] rank " << (rank + 1) << '/' << n
                 << ": selected vertex " << best << ", live trees "
                 << trees.size() << "\n";
-    for (auto& tree : trees) {
+
+    // Reverse index (Appendix A.2): remove `best` only from the (typically
+    // short) list of trees that actually contain it, instead of probing
+    // every live tree. Copy the list first since remove_subtree() mutates
+    // membership[best] as it deactivates `best` in each of these trees, and
+    // mutating a container while ranging over it is undefined behavior.
+    const std::vector<SampleTree*> containing_best = membership[best];
+    for (SampleTree* tree_ptr : containing_best) {
       bool downgraded = false;
-      live_vertices -= remove_subtree(tree, best, counters, downgraded);
+      live_vertices -= remove_subtree(*tree_ptr, best, counters, downgraded,
+                                      touch, membership);
       if (downgraded) ++stats.sparse_downgrades;
-      // See retire_remaining()'s comment: don't let a tree that has
-      // dwindled to a few stragglers stick around indefinitely just
-      // because none of its survivors happen to get selected next.
-      if (tree.remaining > 0 && tree.remaining <= options.min_tree_vertices)
-        retire_remaining(tree, counters, live_vertices);
     }
+    // Every *live* tree's retirement eligibility is still re-checked every
+    // rank, not just the ones `best` happened to be a member of: a newly
+    // grown tree can already be at or below the threshold the moment it's
+    // born (see grow_batch above), and this is also how long-lingering
+    // stragglers (see retire_remaining's own comment) eventually get swept
+    // -- neither case depends on `best` being one of their members. The
+    // number of live trees is bounded by options.max_live_trees regardless
+    // of n (default 1024), so this stays independent of graph size, unlike
+    // the vertex-selection scan this change replaces.
+    for (auto& tree_ptr : trees)
+      if (tree_ptr->remaining > 0 &&
+          tree_ptr->remaining <= options.min_tree_vertices)
+        retire_remaining(*tree_ptr, counters, live_vertices, touch, membership);
+
     trees.erase(std::remove_if(trees.begin(), trees.end(),
-                               [&](SampleTree& tree) {
-                                 if (tree.remaining != 0) return false;
+                               [&](std::unique_ptr<SampleTree>& tree) {
+                                 if (tree->remaining != 0) return false;
                                  // Move out this tree's guts (storage's
                                  // dense arrays, members' capacity) before
                                  // it's logically "removed" -- it may still
