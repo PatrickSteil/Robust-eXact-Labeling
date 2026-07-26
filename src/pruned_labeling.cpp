@@ -35,12 +35,13 @@ std::uint64_t pruned_dijkstra(const AdjacencyList& graph, VertexId root,
                               const std::vector<Distance>& root_distance,
                               HubLabels& labels, bool forward,
                               std::vector<Distance>& distance,
-                              std::vector<VertexId>& touched) {
+                              std::vector<VertexId>& touched,
+                              dijkstra_detail::IndexedMinHeap& heap) {
   std::uint64_t work = 0;
   AbstractDijkstra::search(
       root,
       [&graph](VertexId u) -> const std::vector<Edge>& { return graph[u]; },
-      distance, touched,
+      distance, touched, heap,
       /*on_pop=*/[&](VertexId, Distance) { ++work; },
       /*should_prune=*/
       [&](VertexId u, Distance du) {
@@ -63,7 +64,8 @@ std::uint64_t add_hub(const Graph& graph, VertexId root, VertexId hub_id,
                       std::vector<Distance>& root_in,
                       std::vector<Distance>& distance,
                       std::vector<VertexId>& lookup_touched,
-                      std::vector<VertexId>& search_touched) {
+                      std::vector<VertexId>& search_touched,
+                      dijkstra_detail::IndexedMinHeap& heap) {
   for (const auto& [hub, d] : labels[root].forward) {
     root_out[hub] = d;
     lookup_touched.push_back(hub);
@@ -74,9 +76,9 @@ std::uint64_t add_hub(const Graph& graph, VertexId root, VertexId hub_id,
   }
   std::uint64_t work =
       pruned_dijkstra(graph.adjacency(), root, hub_id, root_out, labels, true,
-                      distance, search_touched);
+                      distance, search_touched, heap);
   work += pruned_dijkstra(graph.reverse_adjacency(), root, hub_id, root_in,
-                          labels, false, distance, search_touched);
+                          labels, false, distance, search_touched, heap);
   for (VertexId hub : lookup_touched) {
     root_out[hub] = kInfinity;
     root_in[hub] = kInfinity;
@@ -105,6 +107,7 @@ struct TreeScratch {
   std::vector<Distance> distance;
   std::vector<VertexId> lookup_touched;
   std::vector<VertexId> distance_touched;
+  dijkstra_detail::IndexedMinHeap heap;
 };
 
 void build_sample_tree(const Graph& graph, VertexId root,
@@ -115,11 +118,13 @@ void build_sample_tree(const Graph& graph, VertexId root,
   if (scratch.root_lookup.size() != n) {
     scratch.root_lookup.assign(n, kInfinity);
     scratch.distance.assign(n, kInfinity);
+    scratch.heap.assign(n);
   }
   auto& root_lookup = scratch.root_lookup;
   auto& distance = scratch.distance;
   auto& lookup_touched = scratch.lookup_touched;
   auto& distance_touched = scratch.distance_touched;
+  auto& heap = scratch.heap;
 
   tree.reset(n, bucket, dense_pool);
   for (const auto& [hub, d] : labels[root].forward) {
@@ -132,7 +137,7 @@ void build_sample_tree(const Graph& graph, VertexId root,
       [&graph](VertexId u) -> const std::vector<Edge>& {
         return graph.adjacency()[u];
       },
-      distance, distance_touched,
+      distance, distance_touched, heap,
       /*on_pop=*/[&](VertexId, Distance) { ++work; },
       /*should_prune=*/
       [&](VertexId u, Distance du) {
@@ -371,6 +376,7 @@ std::vector<VertexId> sampled_order(const Graph& graph,
   std::vector<Distance> root_out(n, kInfinity), root_in(n, kInfinity),
       distance(n, kInfinity);
   std::vector<VertexId> lookup_touched, search_touched;
+  dijkstra_detail::IndexedMinHeap dijkstra_heap(n);
   std::size_t next_root = initial;
   const std::size_t factor = 10 * std::max<std::size_t>(1, initial);
   const std::size_t max_tree_vertices =
@@ -386,9 +392,9 @@ std::vector<VertexId> sampled_order(const Graph& graph,
     const VertexId best = heap.pop_top();
     selected[best] = 1;
     order.push_back(best);
-    label_work +=
-        add_hub(graph, best, static_cast<VertexId>(rank), labels, root_out,
-                root_in, distance, lookup_touched, search_touched);
+    label_work += add_hub(graph, best, static_cast<VertexId>(rank), labels,
+                          root_out, root_in, distance, lookup_touched,
+                          search_touched, dijkstra_heap);
 
     if (options.verbose &&
         (rank < 10 || (rank + 1) % 1000 == 0 || rank + 1 == n))
@@ -467,9 +473,10 @@ LabelingResult PrunedLabeling::compute_with_degree_order(const Graph& graph) {
   std::vector<Distance> root_out(n, kInfinity), root_in(n, kInfinity),
       distance(n, kInfinity);
   std::vector<VertexId> lookup, touched;
+  dijkstra_detail::IndexedMinHeap heap(n);
   for (std::size_t rank = 0; rank < order.size(); ++rank)
     add_hub(graph, order[rank], static_cast<VertexId>(rank), labels, root_out,
-            root_in, distance, lookup, touched);
+            root_in, distance, lookup, touched, heap);
   return finish(std::move(labels), std::move(order));
 }
 
