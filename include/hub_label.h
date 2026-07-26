@@ -8,19 +8,6 @@
 #include "types.h"
 namespace rxl {
 
-// A HubLabel's entries are (hub_id, distance) pairs. hub_id is always the
-// *rank* (processing order) of the hub vertex, assigned at the moment that
-// vertex is added as a hub -- not that vertex's own array index. Labels
-// themselves stay indexed by whatever id space HubLabels is addressed with
-// (original vertex ids by default; rank ids only if the caller explicitly
-// physically reorders via PrunedLabeling::reorder_labels_by_rank). This
-// decoupling means hub ids cluster into small, delta-compressible values
-// for important/frequent hubs without needing to renumber any vertex.
-//
-// forward/backward are DeltaLabel (see delta_label.h): hub ids are kept
-// delta-encoded even while labels are being built by PrunedLabeling, not
-// just when exported by IndexIO.
-
 struct HubLabel {
   Label forward;
   Label backward;
@@ -31,6 +18,7 @@ struct BuildStatistics {
   std::uint64_t sampling_work = 0;
   std::size_t sampled_trees = 0;
   std::size_t peak_live_trees = 0;
+  std::size_t sparse_downgrades = 0;
   double ordering_and_labeling_seconds = 0.0;
 };
 struct LabelingResult {

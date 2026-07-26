@@ -56,6 +56,16 @@ class DeltaLabel {
   DeltaLabel() = default;
 
   void push_back(VertexId hub, Distance distance) {
+    // kInvalidVertex is reserved (types.h) and can never be a legitimate hub
+    // id, but the deeper reason to reject it here specifically is that
+    // `next_min_hub_ = hub + 1` would otherwise silently wrap around to 0,
+    // after which the "strictly increasing" check below would happily
+    // accept hub 0 next -- silently corrupting the invariant this class
+    // exists to guarantee, instead of throwing like every other misuse does.
+    if (hub == kInvalidVertex)
+      throw std::invalid_argument(
+          "DeltaLabel: hub id must not be "
+          "kInvalidVertex");
     if (hub < next_min_hub_)
       throw std::invalid_argument(
           "DeltaLabel: hub ids must be inserted in strictly increasing "

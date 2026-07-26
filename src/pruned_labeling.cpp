@@ -7,19 +7,16 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <queue>
 #include <random>
 #include <stdexcept>
 #include <thread>
 
+#include "abstract_dijkstra.h"
 #include "parallel_for.h"
+#include "sample_tree_storage.h"
 
 namespace rxl {
 namespace {
-using QueueItem = std::pair<Distance, VertexId>;
-using PQ = std::priority_queue<QueueItem, std::vector<QueueItem>,
-                               std::greater<QueueItem>>;
-
 bool covered(const Label& label, const std::vector<Distance>& root_distance,
              Distance search_distance) {
   for (const auto& [hub, target_distance] : label) {
@@ -37,36 +34,23 @@ std::uint64_t pruned_dijkstra(const AdjacencyList& graph, VertexId root,
                               HubLabels& labels, bool forward,
                               std::vector<Distance>& distance,
                               std::vector<VertexId>& touched) {
-  PQ queue;
-  distance[root] = 0;
-  touched.push_back(root);
-  queue.emplace(0, root);
   std::uint64_t work = 0;
-  while (!queue.empty()) {
-    const auto [du, u] = queue.top();
-    queue.pop();
-    if (du != distance[u]) continue;
-    const Label& query = forward ? labels[u].backward : labels[u].forward;
-    ++work;
-    if (covered(query, root_distance, du)) continue;
-    Label& output = forward ? labels[u].backward : labels[u].forward;
-    // The graph traversal (queue/distance, adjacency lookups) stays in
-    // original-vertex-id space, since the graph itself is never physically
-    // reordered. Only the value recorded in the label is the hub's rank:
-    // hub_id is root's processing rank, assigned by the caller. This is
-    // what makes hub IDs inside labels small/clustered for important
-    // (early-processed) vertices without renumbering any vertex.
-    output.push_back(hub_id, du);
-    work += graph[u].size();
-    for (const auto& [v, weight] : graph[u]) {
-      const std::uint64_t candidate = std::uint64_t(du) + weight;
-      if (candidate < distance[v] && candidate < kInfinity) {
-        if (distance[v] == kInfinity) touched.push_back(v);
-        distance[v] = static_cast<Distance>(candidate);
-        queue.emplace(distance[v], v);
-      }
-    }
-  }
+  AbstractDijkstra::search(
+      root,
+      [&graph](VertexId u) -> const std::vector<Edge>& { return graph[u]; },
+      distance, touched,
+      /*on_pop=*/[&](VertexId, Distance) { ++work; },
+      /*should_prune=*/
+      [&](VertexId u, Distance du) {
+        const Label& query = forward ? labels[u].backward : labels[u].forward;
+        return covered(query, root_distance, du);
+      },
+      /*on_settle=*/
+      [&](VertexId u, Distance du) {
+        Label& output = forward ? labels[u].backward : labels[u].forward;
+        output.push_back(hub_id, du);
+        work += graph[u].size();
+      });
   for (VertexId v : touched) distance[v] = kInfinity;
   touched.clear();
   return work;
@@ -78,8 +62,6 @@ std::uint64_t add_hub(const Graph& graph, VertexId root, VertexId hub_id,
                       std::vector<Distance>& distance,
                       std::vector<VertexId>& lookup_touched,
                       std::vector<VertexId>& search_touched) {
-  // root_out/root_in are indexed by hub id (i.e. by rank), matching how
-  // hub entries are now stored in labels[*].forward/backward.
   for (const auto& [hub, d] : labels[root].forward) {
     root_out[hub] = d;
     lookup_touched.push_back(hub);
@@ -102,25 +84,13 @@ std::uint64_t add_hub(const Graph& graph, VertexId root, VertexId hub_id,
 }
 
 struct SampleTree {
+  explicit SampleTree(std::size_t n) : storage(n) {}
   std::size_t bucket = 0;
-  std::vector<VertexId> parent;
-  std::vector<std::vector<VertexId>> children;
-  std::vector<std::uint8_t> alive;
-  std::vector<Score> subtree;
-  // Vertices alive at construction time. Iterating this (instead of the
-  // dense 0..n range) lets score seeding touch only what the search
-  // actually reached.
+  SampleTreeStorage storage;
   std::vector<VertexId> members;
-  // Mirrors "how many entries of `alive` are still 1", updated incrementally
-  // by remove_subtree so tree exhaustion is an O(1) check instead of an
-  // O(n) scan of `alive`.
   std::size_t remaining = 0;
 };
 
-// Per-lane scratch reused across sample-tree builds so each build doesn't
-// have to allocate and fully re-initialize O(n) buffers from scratch. Only
-// the entries actually touched by a search are reset afterwards, the same
-// touched-list trick pruned_dijkstra already uses for `distance`.
 struct TreeScratch {
   std::vector<Distance> root_lookup;
   std::vector<Distance> distance;
@@ -128,8 +98,6 @@ struct TreeScratch {
   std::vector<VertexId> distance_touched;
 };
 
-// A sampled tree represents currently uncovered source-target paths. The tree
-// is grown with the current partial labels and pruned exactly as PL would be.
 SampleTree build_sample_tree(const Graph& graph, VertexId root,
                              const HubLabels& labels, std::size_t bucket,
                              std::uint64_t& work, TreeScratch& scratch) {
@@ -143,59 +111,53 @@ SampleTree build_sample_tree(const Graph& graph, VertexId root,
   auto& lookup_touched = scratch.lookup_touched;
   auto& distance_touched = scratch.distance_touched;
 
-  SampleTree tree;
+  SampleTree tree(n);
   tree.bucket = bucket;
-  tree.parent.assign(n, kInvalidVertex);
-  tree.children.resize(n);
-  tree.alive.assign(n, 0);
-  tree.subtree.assign(n, 0);
   for (const auto& [hub, d] : labels[root].forward) {
     root_lookup[hub] = d;
     lookup_touched.push_back(hub);
   }
-  PQ queue;
-  distance[root] = 0;
-  distance_touched.push_back(root);
-  queue.emplace(0, root);
   std::vector<VertexId> settled;
-  while (!queue.empty()) {
-    const auto [du, u] = queue.top();
-    queue.pop();
-    if (du != distance[u]) continue;
-    ++work;
-    if (covered(labels[u].backward, root_lookup, du)) continue;
-    tree.alive[u] = 1;
-    settled.push_back(u);
-    work += graph.adjacency()[u].size();
-    for (const auto& [v, w] : graph.adjacency()[u]) {
-      const std::uint64_t candidate = std::uint64_t(du) + w;
-      if (candidate < distance[v] && candidate < kInfinity) {
-        if (distance[v] == kInfinity) distance_touched.push_back(v);
-        distance[v] = static_cast<Distance>(candidate);
-        tree.parent[v] = u;
-        queue.emplace(distance[v], v);
-      } else if (candidate == distance[v] && u < tree.parent[v]) {
-        // Deterministic shortest-path-tree tie breaking.
-        tree.parent[v] = u;
-      }
-    }
-  }
+  AbstractDijkstra::search(
+      root,
+      [&graph](VertexId u) -> const std::vector<Edge>& {
+        return graph.adjacency()[u];
+      },
+      distance, distance_touched,
+      /*on_pop=*/[&](VertexId, Distance) { ++work; },
+      /*should_prune=*/
+      [&](VertexId u, Distance du) {
+        return covered(labels[u].backward, root_lookup, du);
+      },
+      /*on_settle=*/
+      [&](VertexId u, Distance) {
+        tree.storage.mark_alive(u);
+        settled.push_back(u);
+        work += graph.adjacency()[u].size();
+      },
+      /*on_relax=*/
+      [&](VertexId u, VertexId v, Distance) { tree.storage.set_parent(v, u); },
+      /*on_non_improving_edge=*/
+      [&](VertexId u, VertexId v, std::uint64_t candidate) {
+        if (candidate == distance[v] && distance[v] != kInfinity &&
+            u < tree.storage.parent_of(v))
+          tree.storage.set_parent(v, u);
+      });
   for (VertexId v : settled) {
-    const VertexId parent = tree.parent[v];
-    if (parent != kInvalidVertex && tree.alive[parent])
-      tree.children[parent].push_back(v);
+    const VertexId parent = tree.storage.parent_of(v);
+    if (parent != kInvalidVertex && tree.storage.alive(parent))
+      tree.storage.add_child(parent, v);
   }
-  // Distances are nondecreasing in settled order, so children occur after
-  // parents; reverse order computes descendant counts.
   for (auto it = settled.rbegin(); it != settled.rend(); ++it) {
     const VertexId v = *it;
-    tree.subtree[v] += 1;
-    const VertexId parent = tree.parent[v];
-    if (parent != kInvalidVertex && tree.alive[parent])
-      tree.subtree[parent] += tree.subtree[v];
+    tree.storage.add_subtree(v, 1);
+    const VertexId parent = tree.storage.parent_of(v);
+    if (parent != kInvalidVertex && tree.storage.alive(parent))
+      tree.storage.add_subtree(parent, tree.storage.subtree_of(v));
   }
   tree.remaining = settled.size();
   tree.members = std::move(settled);
+  tree.storage.maybe_downgrade(tree.members, tree.remaining);
 
   for (VertexId v : distance_touched) distance[v] = kInfinity;
   distance_touched.clear();
@@ -206,43 +168,41 @@ SampleTree build_sample_tree(const Graph& graph, VertexId root,
 
 void add_tree_scores(const SampleTree& tree,
                      std::vector<std::vector<Score>>& counters) {
-  // Only members reached by the search need visiting, not every vertex.
-  for (VertexId v : tree.members)
-    if (tree.alive[v]) counters[v][tree.bucket] += tree.subtree[v];
+  for (VertexId v : tree.members) {
+    if (tree.storage.alive(v)) {
+      counters[v][tree.bucket] += tree.storage.subtree_of(v);
+    }
+  }
 }
 
-// Remove the subtree rooted at hub. This deletes precisely the sampled paths
-// newly covered when hub is selected. Ancestors lose the removed descendants.
-// Returns how many vertices were removed, so callers can keep a running
-// live-vertex total without rescanning `alive`.
 std::size_t remove_subtree(SampleTree& tree, VertexId hub,
-                           std::vector<std::vector<Score>>& counters) {
-  if (!tree.alive[hub]) return 0;
-  const Score removed = tree.subtree[hub];
-  VertexId ancestor = tree.parent[hub];
-  while (ancestor != kInvalidVertex && tree.alive[ancestor]) {
+                           std::vector<std::vector<Score>>& counters,
+                           bool& downgraded) {
+  downgraded = false;
+  auto& storage = tree.storage;
+  if (!storage.alive(hub)) return 0;
+  const Score removed = storage.subtree_of(hub);
+  VertexId ancestor = storage.parent_of(hub);
+  while (ancestor != kInvalidVertex && storage.alive(ancestor)) {
     counters[ancestor][tree.bucket] -= removed;
-    tree.subtree[ancestor] -= removed;
-    ancestor = tree.parent[ancestor];
+    storage.set_subtree(ancestor, storage.subtree_of(ancestor) - removed);
+    ancestor = storage.parent_of(ancestor);
   }
   std::vector<VertexId> stack{hub};
   while (!stack.empty()) {
     const VertexId v = stack.back();
     stack.pop_back();
-    if (!tree.alive[v]) continue;
-    counters[v][tree.bucket] -= tree.subtree[v];
-    tree.alive[v] = 0;
-    for (VertexId child : tree.children[v]) stack.push_back(child);
+    if (!storage.alive(v)) continue;
+    counters[v][tree.bucket] -= storage.subtree_of(v);
+    const std::vector<VertexId> children = storage.children_of(v);
+    storage.deactivate(v);
+    for (VertexId child : children) stack.push_back(child);
   }
   tree.remaining -= static_cast<std::size_t>(removed);
+  downgraded = storage.maybe_downgrade(tree.members, tree.remaining);
   return static_cast<std::size_t>(removed);
 }
 
-// Sums `counter` and its "robust" tail (after discarding the `discard`
-// largest buckets) using a caller-supplied scratch buffer, instead of
-// allocating and sorting a fresh vector on every call. This is by far the
-// hottest call in the ordering loop (once per still-unselected vertex, per
-// rank), so avoiding the allocation matters far more than the sort itself.
 std::pair<Score, Score> priority(const std::vector<Score>& counter,
                                  std::size_t discard,
                                  std::vector<Score>& scratch) {
@@ -272,25 +232,20 @@ std::vector<VertexId> sampled_order(const Graph& graph,
   std::vector<std::vector<Score>> counters(n, std::vector<Score>(buckets, 0));
   std::uint64_t tree_work = 0, label_work = 0;
   const std::size_t threads = std::max<std::size_t>(1, options.num_threads);
-  // Running total of alive vertices across all live trees, maintained
-  // incrementally by grow_batch (on insertion) and remove_subtree's return
-  // value (on removal) instead of being recomputed with std::count every
-  // rank, which used to cost O(n) per live tree per rank.
   std::size_t live_vertices = 0;
-  // One reusable scratch buffer per concurrent lane; a batch never has more
-  // entries than `threads`, so indexing by position in the batch is safe.
   std::vector<TreeScratch> scratch_pool(threads);
   auto grow_batch = [&](const std::vector<VertexId>& batch_roots,
                         std::size_t first_bucket) {
     using Built = std::pair<SampleTree, std::uint64_t>;
-    std::vector<Built> built(batch_roots.size());
+    std::vector<Built> built;
+    built.reserve(batch_roots.size());
     if (threads == 1 || batch_roots.size() == 1) {
       for (std::size_t i = 0; i < batch_roots.size(); ++i) {
         std::uint64_t work = 0;
-        built[i].first = build_sample_tree(graph, batch_roots[i], labels,
-                                           (first_bucket + i) % buckets, work,
-                                           scratch_pool[0]);
-        built[i].second = work;
+        auto tree = build_sample_tree(graph, batch_roots[i], labels,
+                                      (first_bucket + i) % buckets, work,
+                                      scratch_pool[0]);
+        built.emplace_back(std::move(tree), work);
       }
     } else {
       std::vector<std::future<Built>> futures;
@@ -306,14 +261,14 @@ std::vector<VertexId> sampled_order(const Graph& graph,
           return Built{std::move(tree), work};
         }));
       }
-      for (std::size_t i = 0; i < futures.size(); ++i)
-        built[i] = futures[i].get();
+      for (auto& future : futures) built.push_back(future.get());
     }
     for (auto& item : built) {
       tree_work += item.second;
       stats.sampling_work += item.second;
       add_tree_scores(item.first, counters);
       live_vertices += item.first.remaining;
+      if (!item.first.storage.is_dense()) ++stats.sparse_downgrades;
       trees.push_back(std::move(item.first));
       ++stats.sampled_trees;
     }
@@ -324,7 +279,6 @@ std::vector<VertexId> sampled_order(const Graph& graph,
         std::vector<VertexId>(roots.begin() + begin, roots.begin() + end),
         trees.size() % buckets);
   }
-  // The paper treats the initial k trees as free in balancing counters.
   tree_work = 0;
 
   std::vector<VertexId> order;
@@ -352,8 +306,7 @@ std::vector<VertexId> sampled_order(const Graph& graph,
         const std::size_t degree =
             graph.adjacency()[v].size() + graph.reverse_adjacency()[v].size();
         if (best == kInvalidVertex || p > best_priority ||
-            (p == best_priority && degree > best_degree) ||
-            (p == best_priority && degree == best_degree && v < best)) {
+            (p == best_priority && degree > best_degree)) {
           best = v;
           best_priority = p;
           best_degree = degree;
@@ -371,7 +324,9 @@ std::vector<VertexId> sampled_order(const Graph& graph,
                 << ": selected vertex " << best << ", live trees "
                 << trees.size() << "\n";
     for (auto& tree : trees) {
-      live_vertices -= remove_subtree(tree, best, counters);
+      bool downgraded = false;
+      live_vertices -= remove_subtree(tree, best, counters, downgraded);
+      if (downgraded) ++stats.sparse_downgrades;
     }
     trees.erase(std::remove_if(
                     trees.begin(), trees.end(),
@@ -401,16 +356,7 @@ std::vector<VertexId> sampled_order(const Graph& graph,
   return order;
 }
 
-LabelingResult finish(HubLabels labels, std::vector<VertexId> order,
-                      std::size_t threads) {
-  (void)threads;
-  // No sorting step needed here anymore. Hub ids appended to a label are
-  // already strictly increasing by construction: add_hub()/pruned_dijkstra()
-  // always push_back() with hub_id equal to the *current* rank, and ranks
-  // only ever increase across the single pass over 0..n-1 that drives both
-  // compute() and compute_with_degree_order(). DeltaLabel::push_back() also
-  // enforces this at build time (it throws on an out-of-order hub id), so
-  // this invariant is checked, not just assumed.
+LabelingResult finish(HubLabels labels, std::vector<VertexId> order) {
   std::vector<Rank> ranks(order.size());
   for (Rank rank = 0; rank < order.size(); ++rank) ranks[order[rank]] = rank;
   return {std::move(labels), std::move(order), std::move(ranks), {}};
@@ -440,8 +386,7 @@ LabelingResult PrunedLabeling::compute_with_degree_order(const Graph& graph) {
   for (std::size_t rank = 0; rank < order.size(); ++rank)
     add_hub(graph, order[rank], static_cast<VertexId>(rank), labels, root_out,
             root_in, distance, lookup, touched);
-  return finish(std::move(labels), std::move(order),
-                std::max<std::size_t>(1, std::thread::hardware_concurrency()));
+  return finish(std::move(labels), std::move(order));
 }
 
 LabelingResult PrunedLabeling::compute(const Graph& graph,
@@ -454,8 +399,7 @@ LabelingResult PrunedLabeling::compute(const Graph& graph,
   BuildStatistics statistics;
   const auto start = std::chrono::steady_clock::now();
   auto order = sampled_order(graph, options, labels, statistics);
-  auto result = finish(std::move(labels), std::move(order),
-                       std::max<std::size_t>(1, options.num_threads));
+  auto result = finish(std::move(labels), std::move(order));
   statistics.ordering_and_labeling_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start)
           .count();

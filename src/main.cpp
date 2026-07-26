@@ -2,9 +2,11 @@
 #include <cctype>
 #include <chrono>
 #include <exception>
+#include <filesystem>
 #include <iostream>
 #include <random>
 #include <string>
+#include <system_error>
 #include <thread>
 
 #include "graph.h"
@@ -20,6 +22,19 @@ void usage(const char* program) {
       << "Usage: " << program
       << " [graph] [options]\n"
          "  --export <file>   export labels/rank maps to a binary RXL index\n"
+         "  --label-encoding <two-block|varint>\n"
+         "                    on-disk hub-id/distance byte packing used by "
+         "--export\n"
+         "                    (default: two-block). two-block is the "
+         "paper's fixed\n"
+         "                    1-byte/4-byte split (Section 4.1); varint "
+         "packs every\n"
+         "                    value as a LEB128 varint (7 payload bits per "
+         "byte, top\n"
+         "                    bit set to mean \"one more byte follows\"), "
+         "often\n"
+         "                    smaller but slower to decode. Ignored "
+         "without --export.\n"
          "  --import <file>   load labels/rank maps from a binary RXL index\n"
          "                    instead of building them (graph argument then\n"
          "                    becomes optional)\n"
@@ -58,11 +73,22 @@ void run_benchmark(const HubLabels& labels, std::size_t num_queries,
   std::vector<std::pair<VertexId, VertexId>> queries(num_queries);
   for (auto& q : queries) q = {dist(rng), dist(rng)};
 
-  std::size_t found{0};
+  // Query generation stays serial (so the exact same queries are asked
+  // regardless of --threads), and only the timed portion -- independent,
+  // read-only lookups against `labels` -- is handed to parallel_for. Each
+  // worker tallies hits in a local (uncontended) counter and folds it into
+  // `found` once per chunk rather than per query, so the shared atomic is
+  // touched O(threads) times, not O(num_queries) times.
+  std::atomic<std::size_t> found{0};
   const auto start = std::chrono::steady_clock::now();
-  for (const auto& [s, t] : queries) {
-    if (QuerySupport::distance(labels, s, t) != kInfinity) ++found;
-  }
+  parallel_for(num_queries, threads, [&](std::size_t lo, std::size_t hi) {
+    std::size_t local = 0;
+    for (std::size_t i = lo; i < hi; ++i) {
+      const auto& [s, t] = queries[i];
+      if (QuerySupport::distance(labels, s, t) != kInfinity) ++local;
+    }
+    found += local;
+  });
   const auto end = std::chrono::steady_clock::now();
   const double total_us =
       std::chrono::duration<double, std::micro>(end - start).count();
@@ -82,6 +108,7 @@ int main(int argc, char** argv) {
     std::string export_path, import_path;
     std::size_t threads = 1, benchmark_queries = 10000;
     int seed = 42;
+    LabelEncoding encoding = LabelEncoding::TwoBlockDelta;
     std::vector<std::string> positional;
     for (int i = 1; i < argc; ++i) {
       const std::string arg = argv[i];
@@ -97,6 +124,18 @@ int main(int argc, char** argv) {
       } else if (arg == "--import") {
         if (++i >= argc) throw std::invalid_argument("--import needs a path");
         import_path = argv[i];
+      } else if (arg == "--label-encoding") {
+        if (++i >= argc)
+          throw std::invalid_argument("--label-encoding needs a value");
+        const std::string value = argv[i];
+        if (value == "two-block")
+          encoding = LabelEncoding::TwoBlockDelta;
+        else if (value == "varint")
+          encoding = LabelEncoding::Varint;
+        else
+          throw std::invalid_argument(
+              "--label-encoding must be 'two-block' or 'varint', got: " +
+              value);
       } else if (arg == "--threads") {
         if (++i >= argc) throw std::invalid_argument("--threads needs a count");
         threads = std::stoull(argv[i]);
@@ -161,6 +200,8 @@ int main(int argc, char** argv) {
                   << result.statistics.ordering_and_labeling_seconds
                   << ", sampled-trees=" << result.statistics.sampled_trees
                   << ", peak-live-trees=" << result.statistics.peak_live_trees
+                  << ", sparse-downgrades="
+                  << result.statistics.sparse_downgrades
                   << ", sampling-work=" << result.statistics.sampling_work
                   << ", labeling-work=" << result.statistics.labeling_work
                   << '\n';
@@ -168,8 +209,16 @@ int main(int argc, char** argv) {
     }
 
     if (!export_path.empty()) {
-      IndexIO::export_binary(result, export_path);
-      if (verbose) std::cout << "Exported index to " << export_path << '\n';
+      IndexIO::export_binary(result, export_path, encoding);
+      if (verbose) {
+        std::error_code ec;
+        const auto bytes = std::filesystem::file_size(export_path, ec);
+        std::cout << "Exported index to " << export_path << ", encoding="
+                  << (encoding == LabelEncoding::Varint ? "varint"
+                                                        : "two-block");
+        if (!ec) std::cout << ", bytes=" << bytes;
+        std::cout << '\n';
+      }
     }
     if (do_benchmark) {
       run_benchmark(result.labels, benchmark_queries, threads, seed);

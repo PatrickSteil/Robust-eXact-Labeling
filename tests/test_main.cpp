@@ -1,11 +1,17 @@
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <tuple>
 
+#include "abstract_dijkstra.h"
 #include "delta_label.h"
 #include "dijkstra.h"
 #include "graph.h"
@@ -33,7 +39,7 @@ void test_delta_label() {
 
   // Decoding via the iterator must reproduce exactly what was pushed.
   std::vector<std::pair<VertexId, Distance>> decoded(label.begin(),
-                                                      label.end());
+                                                     label.end());
   const std::vector<std::pair<VertexId, Distance>> expected{
       {0, 0}, {16, 5}, {29, 9}, {189, 12}};
   CHECK(decoded == expected);
@@ -66,10 +72,10 @@ void test_delta_label() {
 
   // from_deltas() is the inverse of raw_deltas()/raw_distances(), and
   // validates that decoded hub ids stay within range.
-  auto rebuilt = DeltaLabel::from_deltas(label.raw_deltas(),
-                                        {label.raw_distances().begin(),
-                                         label.raw_distances().end()},
-                                        /*n=*/200);
+  auto rebuilt = DeltaLabel::from_deltas(
+      label.raw_deltas(),
+      {label.raw_distances().begin(), label.raw_distances().end()},
+      /*n=*/200);
   const std::vector<std::pair<VertexId, Distance>> rebuilt_decoded(
       rebuilt.begin(), rebuilt.end());
   CHECK(rebuilt_decoded == expected);
@@ -174,6 +180,86 @@ void test_export_roundtrip() {
       CHECK(QuerySupport::distance(loaded.labels, s, t) ==
             QuerySupport::distance(result.labels, s, t));
 }
+// export_binary()'s encoding parameter defaults to TwoBlockDelta, and that
+// path is untouched code from before the Varint encoding existed -- pin
+// that an unspecified encoding still produces the exact same bytes as
+// explicitly asking for TwoBlockDelta, so a future refactor can't quietly
+// change what "no encoding given" means.
+void test_default_encoding_is_two_block() {
+  auto g = make_graph(4, {{0, 1, 5}, {1, 2, 6}, {2, 0, 2}});
+  auto result = PrunedLabeling::compute_with_degree_order(g);
+  const std::string implicit_path = "rxl_test_encoding_default.bin";
+  const std::string explicit_path = "rxl_test_encoding_two_block.bin";
+  IndexIO::export_binary(result, implicit_path);
+  IndexIO::export_binary(result, explicit_path, LabelEncoding::TwoBlockDelta);
+  std::ifstream fa(implicit_path, std::ios::binary);
+  std::ifstream fb(explicit_path, std::ios::binary);
+  const std::vector<char> bytes_a((std::istreambuf_iterator<char>(fa)),
+                                  std::istreambuf_iterator<char>());
+  const std::vector<char> bytes_b((std::istreambuf_iterator<char>(fb)),
+                                  std::istreambuf_iterator<char>());
+  std::remove(implicit_path.c_str());
+  std::remove(explicit_path.c_str());
+  CHECK(bytes_a == bytes_b);
+}
+// General correctness of the varint encoding on a real (non-synthetic)
+// labeling: every query answer must survive the round trip unchanged.
+void test_varint_encoding_roundtrip() {
+  std::mt19937 rng(4242);
+  std::vector<std::tuple<VertexId, VertexId, Distance>> arcs;
+  for (VertexId u = 0; u < 60; ++u)
+    for (VertexId v = 0; v < 60; ++v)
+      if (u != v && rng() % 6 == 0) arcs.emplace_back(u, v, 1 + rng() % 500);
+  auto g = make_graph(60, arcs);
+  SamplingOptions o;
+  o.initial_trees = 16;
+  o.counter_buckets = 4;
+  o.discarded_max_buckets = 1;
+  o.random_seed = 4242;
+  auto result = PrunedLabeling::compute(g, o);
+  const std::string path = "rxl_test_varint_roundtrip.bin";
+  IndexIO::export_binary(result, path, LabelEncoding::Varint);
+  auto loaded = IndexIO::import_binary(path);
+  std::remove(path.c_str());
+  CHECK(loaded.rank_to_vertex == result.rank_to_vertex);
+  CHECK(loaded.vertex_to_rank == result.vertex_to_rank);
+  check_exact(g, loaded.labels);
+}
+// Distances aren't constrained to stay below n the way hub-id deltas are,
+// so they're the practical way to drive the varint codec through every one
+// of its continuation-byte-count boundaries (1 through 5 bytes) without
+// needing a graph with billions of vertices. Deltas go through the exact
+// same write_varint()/read_varint() routines, so this covers both fields.
+void test_varint_encoding_byte_boundaries() {
+  const std::vector<Distance> boundary_values = {
+      0,     1,       126,     127,       128,       16383,
+      16384, 2097151, 2097152, 268435455, 268435456, kInfinity - 1};
+  const VertexId n = static_cast<VertexId>(boundary_values.size());
+  LabelingResult result;
+  result.labels.resize(n);
+  result.rank_to_vertex.resize(n);
+  result.vertex_to_rank.resize(n);
+  for (VertexId i = 0; i < n; ++i) result.rank_to_vertex[i] = i;
+  for (VertexId i = 0; i < n; ++i) result.vertex_to_rank[i] = i;
+  // Consecutive hub ids 0..n-1 (all deltas 0) so from_deltas()'s "hub < n"
+  // check passes; the point of this test is the distance field, not deltas.
+  const std::vector<VertexId> deltas(n, 0);
+  const std::vector<Distance> distances(boundary_values.begin(),
+                                        boundary_values.end());
+  result.labels[0].forward = Label::from_deltas(deltas, distances, n);
+  result.labels[0].backward = Label::from_deltas(deltas, distances, n);
+
+  const std::string path = "rxl_test_varint_boundaries.bin";
+  IndexIO::export_binary(result, path, LabelEncoding::Varint);
+  auto loaded = IndexIO::import_binary(path);
+  std::remove(path.c_str());
+
+  std::vector<Distance> forward, backward;
+  for (const auto& [hub, d] : loaded.labels[0].forward) forward.push_back(d);
+  for (const auto& [hub, d] : loaded.labels[0].backward) backward.push_back(d);
+  CHECK(forward == distances);
+  CHECK(backward == distances);
+}
 void test_parallel_determinism() {
   std::mt19937 rng(17);
   std::vector<std::tuple<VertexId, VertexId, Distance>> arcs;
@@ -194,6 +280,30 @@ void test_parallel_determinism() {
   check_exact(g, one.labels);
   check_exact(g, four.labels);
 }
+// Large enough (n=120, so the n/8 small-tree threshold from Appendix A.2 is
+// 15) that SamPG's sampled trees actually shrink across that boundary
+// during the run, exercising the google::sparse_hash_map-backed path in
+// include/sample_tree_storage.h -- not just its dense-array mode, which is
+// all a small graph like the other tests' n=25 reliably reaches.
+void test_sparse_tree_storage() {
+  std::mt19937 rng(2024);
+  std::vector<std::tuple<VertexId, VertexId, Distance>> arcs;
+  const VertexId n = 120;
+  for (VertexId u = 0; u < n; ++u)
+    for (VertexId v = 0; v < n; ++v)
+      if (u != v && rng() % 9 == 0) arcs.emplace_back(u, v, 1 + rng() % 50);
+  auto g = make_graph(n, arcs);
+  SamplingOptions o;
+  o.initial_trees = 32;
+  o.counter_buckets = 8;
+  o.discarded_max_buckets = 1;
+  o.random_seed = 2024;
+  auto result = PrunedLabeling::compute(g, o);
+  check_exact(g, result.labels);
+  // The real point of this test: confirm the hash-map optimization is wired
+  // in and actually engaging, not merely present as unused code.
+  CHECK(result.statistics.sparse_downgrades > 0);
+}
 void test_statistics() {
   auto g = make_graph(3, {{0, 1, 1}, {1, 2, 2}});
   auto gs = compute_graph_statistics(g);
@@ -211,7 +321,11 @@ int main() {
     test_directed_weighted();
     test_rank_reorder();
     test_export_roundtrip();
+    test_default_encoding_is_two_block();
+    test_varint_encoding_roundtrip();
+    test_varint_encoding_byte_boundaries();
     test_parallel_determinism();
+    test_sparse_tree_storage();
     test_statistics();
     std::cout << "All RXL tests passed\n";
   } catch (const std::exception& e) {

@@ -54,6 +54,38 @@ class SampleTreeStorage {
     dense_subtree_.assign(n_, 0);
   }
 
+  // Move-only, via swap. google::sparse_hash_map predates C++11 move
+  // semantics: it only has a copy constructor/assignment (plus a swap()
+  // it uses internally for resizing), so the *implicitly*-defined move
+  // operations here would silently degrade to an O(size) copy of sparse_
+  // for any tree already downgraded to the hash-map backend -- exactly the
+  // cost this class exists to avoid, e.g. every time SampleTree objects get
+  // reshuffled by std::remove_if()/erase() in the ordering loop. Defining
+  // these explicitly with swap() keeps every move O(1) regardless of
+  // backend, and makes the class non-copyable (fine: nothing ever needs to
+  // copy a whole sampled tree, only move it around or read from it).
+  SampleTreeStorage(SampleTreeStorage&& other) noexcept
+      : n_(other.n_), is_dense_(other.is_dense_) {
+    dense_parent_.swap(other.dense_parent_);
+    dense_children_.swap(other.dense_children_);
+    dense_alive_.swap(other.dense_alive_);
+    dense_subtree_.swap(other.dense_subtree_);
+    sparse_.swap(other.sparse_);
+  }
+  SampleTreeStorage& operator=(SampleTreeStorage&& other) noexcept {
+    if (this == &other) return *this;
+    n_ = other.n_;
+    is_dense_ = other.is_dense_;
+    dense_parent_.swap(other.dense_parent_);
+    dense_children_.swap(other.dense_children_);
+    dense_alive_.swap(other.dense_alive_);
+    dense_subtree_.swap(other.dense_subtree_);
+    sparse_.swap(other.sparse_);
+    return *this;
+  }
+  SampleTreeStorage(const SampleTreeStorage&) = delete;
+  SampleTreeStorage& operator=(const SampleTreeStorage&) = delete;
+
   bool is_dense() const { return is_dense_; }
 
   bool alive(VertexId v) const {
@@ -127,10 +159,11 @@ class SampleTreeStorage {
   // settled), so this scan costs O(members.size()), not O(n): for trees
   // that were already pruned at birth, that is the tree's own small size;
   // for large seed trees it is a one-off cost paid exactly once, when they
-  // first cross the threshold. No-op if already sparse or still large.
-  void maybe_downgrade(const std::vector<VertexId>& members,
+  // first cross the threshold. No-op (returns false) if already sparse or
+  // still large; returns true iff this call performed the conversion.
+  bool maybe_downgrade(const std::vector<VertexId>& members,
                        std::size_t live_count) {
-    if (!is_dense_ || live_count >= dense_threshold(n_)) return;
+    if (!is_dense_ || live_count >= dense_threshold(n_)) return false;
     sparse_.set_deleted_key(kInvalidVertex);
     sparse_.resize(live_count * 2 + 1);  // avoid rehashing while filling.
     for (VertexId v : members) {
@@ -147,6 +180,7 @@ class SampleTreeStorage {
     std::vector<std::uint8_t>().swap(dense_alive_);
     std::vector<Score>().swap(dense_subtree_);
     is_dense_ = false;
+    return true;
   }
 
  private:
