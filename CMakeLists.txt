@@ -31,9 +31,9 @@ target_compile_options(rxl PRIVATE
   >
 )
 
-add_executable(rxl_app src/main.cpp)
-target_link_libraries(rxl_app PRIVATE rxl)
-target_include_directories(rxl_app PRIVATE third_party/cmdparser)
+add_executable(RXL src/main.cpp)
+target_link_libraries(RXL PRIVATE rxl)
+target_include_directories(RXL PRIVATE third_party/cmdparser)
 
 add_executable(benchmark src/bench_grid.cpp)
 target_link_libraries(benchmark PRIVATE rxl)
@@ -42,7 +42,7 @@ target_include_directories(benchmark PRIVATE third_party/cmdparser)
 include(CTest)
 
 if(BUILD_TESTING)
-  add_executable(rxl_tests tests/test_main.cpp)
-  target_link_libraries(rxl_tests PRIVATE rxl)
+  add_executable(tests tests/test_main.cpp)
+  target_link_libraries(tests PRIVATE rxl)
   add_test(NAME rxl_unit_tests COMMAND rxl_tests)
 endif()

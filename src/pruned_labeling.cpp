@@ -21,7 +21,25 @@ namespace rxl {
 namespace {
 bool covered(const Label &label, const std::vector<Distance> &root_distance,
              Distance search_distance) {
+  const auto &deltas = label.raw_deltas();
+  const std::size_t m = deltas.size();
+  if (m == 0)
+    return false;
+
+  constexpr std::size_t kPrefetchAhead = 6;
+  VertexId ahead_hub = deltas[0];
+  std::size_t ahead_index = 0;
+  auto prefetch_next_hub = [&] {
+    __builtin_prefetch(&root_distance[ahead_hub], /*rw=*/0, /*locality=*/1);
+    if (++ahead_index < m)
+      ahead_hub = static_cast<VertexId>(ahead_hub + 1 + deltas[ahead_index]);
+  };
+  for (std::size_t k = 0; k < kPrefetchAhead && k < m; ++k)
+    prefetch_next_hub();
+
   for (const auto &[hub, target_distance] : label) {
+    if (ahead_index < m)
+      prefetch_next_hub();
     const Distance root = root_distance[hub];
     if (root != kInfinity &&
         std::uint64_t(root) + target_distance <= search_distance)
@@ -53,6 +71,10 @@ std::uint64_t pruned_dijkstra(const AdjacencyList &graph, VertexId root,
         Label &output = forward ? labels[u].backward : labels[u].forward;
         output.push_back(hub_id, du);
         work += graph[u].size();
+      },
+      /*on_relax=*/
+      [&](VertexId, VertexId v, Distance) {
+        (forward ? labels[v].backward : labels[v].forward).prefetch();
       });
   for (VertexId v : touched)
     distance[v] = kInfinity;
@@ -152,7 +174,13 @@ void build_sample_tree(const Graph &graph, VertexId root,
         work += graph.adjacency()[u].size();
       },
       /*on_relax=*/
-      [&](VertexId u, VertexId v, Distance) { tree.storage.set_parent(v, u); },
+      [&](VertexId u, VertexId v, Distance) {
+        tree.storage.set_parent(v, u);
+        // Same rationale as pruned_dijkstra's on_relax above: warm up
+        // v's backward label now, ahead of the should_prune call that
+        // will read it once v reaches the front of the heap.
+        labels[v].backward.prefetch();
+      },
       /*on_non_improving_edge=*/
       [&](VertexId u, VertexId v, std::uint64_t candidate) {
         if (candidate == distance[v] && distance[v] != kInfinity &&

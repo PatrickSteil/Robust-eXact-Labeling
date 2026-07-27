@@ -20,12 +20,12 @@
 #include "query_support.h"
 #include "statistics.h"
 using namespace rxl;
-#define CHECK(x)                                                            \
-  do {                                                                      \
-    if (!(x)) throw std::runtime_error(std::string("CHECK failed: ") + #x); \
+#define CHECK(x)                                                               \
+  do {                                                                         \
+    if (!(x))                                                                  \
+      throw std::runtime_error(std::string("CHECK failed: ") + #x);            \
   } while (0)
-// DeltaLabel is deliberately its own class (delta_label.h) so it can be
-// tested in isolation from graphs/labeling/queries.
+
 void test_delta_label() {
   DeltaLabel label;
   CHECK(label.empty());
@@ -37,60 +37,50 @@ void test_delta_label() {
   CHECK(!label.empty());
   CHECK(label.size() == 4);
 
-  // Decoding via the iterator must reproduce exactly what was pushed.
   std::vector<std::pair<VertexId, Distance>> decoded(label.begin(),
                                                      label.end());
   const std::vector<std::pair<VertexId, Distance>> expected{
       {0, 0}, {16, 5}, {29, 9}, {189, 12}};
   CHECK(decoded == expected);
 
-  // Matches the example in the paper (Section 4.1): hubs (0 16 29 189)
-  // delta-encode to (0 15 12 159).
   const std::vector<VertexId> expected_deltas{0, 15, 12, 159};
   CHECK(label.raw_deltas() == expected_deltas);
 
-  // Structured bindings must work on the decoded entries, same as before.
   VertexId sum_hubs = 0;
-  for (const auto& [hub, d] : label) sum_hubs += hub + d;
+  for (const auto &[hub, d] : label)
+    sum_hubs += hub + d;
   CHECK(sum_hubs == 0 + 0 + 16 + 5 + 29 + 9 + 189 + 12);
 
-  // Strictly-increasing invariant is enforced at push time.
   bool threw = false;
   try {
-    label.push_back(189, 1);  // repeat of the last hub id
-  } catch (const std::invalid_argument&) {
+    label.push_back(189, 1); // repeat of the last hub id
+  } catch (const std::invalid_argument &) {
     threw = true;
   }
   CHECK(threw);
   threw = false;
   try {
-    label.push_back(5, 1);  // smaller than the last hub id
-  } catch (const std::invalid_argument&) {
+    label.push_back(5, 1); // smaller than the last hub id
+  } catch (const std::invalid_argument &) {
     threw = true;
   }
   CHECK(threw);
 
-  // from_deltas() is the inverse of raw_deltas()/raw_distances(), and
-  // validates that decoded hub ids stay within range. raw_distances()
-  // materializes a fresh flat vector each call (the label's actual storage
-  // is run-length encoded, see delta_label.h), so it's bound to a local
-  // once rather than called twice in the same expression.
   const std::vector<Distance> flat_distances = label.raw_distances();
   auto rebuilt = DeltaLabel::from_deltas(label.raw_deltas(), flat_distances,
-                                        /*n=*/200);
+                                         /*n=*/200);
   const std::vector<std::pair<VertexId, Distance>> rebuilt_decoded(
       rebuilt.begin(), rebuilt.end());
   CHECK(rebuilt_decoded == expected);
   bool out_of_range = false;
   try {
     DeltaLabel::from_deltas(label.raw_deltas(), flat_distances,
-                            /*n=*/189);  // hub 189 is not < 189
-  } catch (const std::runtime_error&) {
+                            /*n=*/189); // hub 189 is not < 189
+  } catch (const std::runtime_error &) {
     out_of_range = true;
   }
   CHECK(out_of_range);
 
-  // An empty label iterates zero times and round-trips cleanly.
   DeltaLabel empty_label;
   CHECK(empty_label.begin() == empty_label.end());
   auto rebuilt_empty = DeltaLabel::from_deltas({}, {}, 10);
@@ -98,7 +88,7 @@ void test_delta_label() {
 }
 Graph make_graph(
     std::size_t n,
-    const std::vector<std::tuple<VertexId, VertexId, Distance>>& arcs) {
+    const std::vector<std::tuple<VertexId, VertexId, Distance>> &arcs) {
   AdjacencyList a(n), r(n);
   for (auto [u, v, w] : arcs) {
     a[u].emplace_back(v, w);
@@ -106,7 +96,7 @@ Graph make_graph(
   }
   return Graph(std::move(a), std::move(r));
 }
-void check_exact(const Graph& g, const HubLabels& labels) {
+void check_exact(const Graph &g, const HubLabels &labels) {
   for (VertexId s = 0; s < g.num_vertices(); ++s) {
     auto truth = Dijkstra::shortest_distances(g.adjacency(), s);
     for (VertexId t = 0; t < g.num_vertices(); ++t)
@@ -140,18 +130,17 @@ void test_rank_reorder() {
       CHECK(QuerySupport::distance(result.labels, map[s], map[t]) ==
             truth[s][t]);
 }
-// Every vertex is trivially a hub of itself at distance 0. That self-entry's
-// hub id must be the vertex's assigned *rank* (vertex_to_rank[v]), not v
-// itself -- this is the core change that lets hub ids stay small/clustered
-// without ever physically renumbering the graph or the labels.
-void check_hub_ids_are_ranks(const LabelingResult& result) {
+
+void check_hub_ids_are_ranks(const LabelingResult &result) {
   for (VertexId v = 0; v < result.labels.size(); ++v) {
     const VertexId expected = result.vertex_to_rank[v];
     bool forward_ok = false, backward_ok = false;
-    for (const auto& [hub, d] : result.labels[v].forward)
-      if (d == 0 && hub == expected) forward_ok = true;
-    for (const auto& [hub, d] : result.labels[v].backward)
-      if (d == 0 && hub == expected) backward_ok = true;
+    for (const auto &[hub, d] : result.labels[v].forward)
+      if (d == 0 && hub == expected)
+        forward_ok = true;
+    for (const auto &[hub, d] : result.labels[v].backward)
+      if (d == 0 && hub == expected)
+        backward_ok = true;
     CHECK(forward_ok);
     CHECK(backward_ok);
   }
@@ -182,11 +171,7 @@ void test_export_roundtrip() {
       CHECK(QuerySupport::distance(loaded.labels, s, t) ==
             QuerySupport::distance(result.labels, s, t));
 }
-// export_binary()'s encoding parameter defaults to TwoBlockDelta, and that
-// path is untouched code from before the Varint encoding existed -- pin
-// that an unspecified encoding still produces the exact same bytes as
-// explicitly asking for TwoBlockDelta, so a future refactor can't quietly
-// change what "no encoding given" means.
+
 void test_default_encoding_is_two_block() {
   auto g = make_graph(4, {{0, 1, 5}, {1, 2, 6}, {2, 0, 2}});
   auto result = PrunedLabeling::compute_with_degree_order(g);
@@ -204,14 +189,14 @@ void test_default_encoding_is_two_block() {
   std::remove(explicit_path.c_str());
   CHECK(bytes_a == bytes_b);
 }
-// General correctness of the varint encoding on a real (non-synthetic)
-// labeling: every query answer must survive the round trip unchanged.
+
 void test_varint_encoding_roundtrip() {
   std::mt19937 rng(4242);
   std::vector<std::tuple<VertexId, VertexId, Distance>> arcs;
   for (VertexId u = 0; u < 60; ++u)
     for (VertexId v = 0; v < 60; ++v)
-      if (u != v && rng() % 6 == 0) arcs.emplace_back(u, v, 1 + rng() % 500);
+      if (u != v && rng() % 6 == 0)
+        arcs.emplace_back(u, v, 1 + rng() % 500);
   auto g = make_graph(60, arcs);
   SamplingOptions o;
   o.initial_trees = 16;
@@ -227,11 +212,7 @@ void test_varint_encoding_roundtrip() {
   CHECK(loaded.vertex_to_rank == result.vertex_to_rank);
   check_exact(g, loaded.labels);
 }
-// Distances aren't constrained to stay below n the way hub-id deltas are,
-// so they're the practical way to drive the varint codec through every one
-// of its continuation-byte-count boundaries (1 through 5 bytes) without
-// needing a graph with billions of vertices. Deltas go through the exact
-// same write_varint()/read_varint() routines, so this covers both fields.
+
 void test_varint_encoding_byte_boundaries() {
   const std::vector<Distance> boundary_values = {
       0,     1,       126,     127,       128,       16383,
@@ -241,10 +222,10 @@ void test_varint_encoding_byte_boundaries() {
   result.labels.resize(n);
   result.rank_to_vertex.resize(n);
   result.vertex_to_rank.resize(n);
-  for (VertexId i = 0; i < n; ++i) result.rank_to_vertex[i] = i;
-  for (VertexId i = 0; i < n; ++i) result.vertex_to_rank[i] = i;
-  // Consecutive hub ids 0..n-1 (all deltas 0) so from_deltas()'s "hub < n"
-  // check passes; the point of this test is the distance field, not deltas.
+  for (VertexId i = 0; i < n; ++i)
+    result.rank_to_vertex[i] = i;
+  for (VertexId i = 0; i < n; ++i)
+    result.vertex_to_rank[i] = i;
   const std::vector<VertexId> deltas(n, 0);
   const std::vector<Distance> distances(boundary_values.begin(),
                                         boundary_values.end());
@@ -257,8 +238,10 @@ void test_varint_encoding_byte_boundaries() {
   std::remove(path.c_str());
 
   std::vector<Distance> forward, backward;
-  for (const auto& [hub, d] : loaded.labels[0].forward) forward.push_back(d);
-  for (const auto& [hub, d] : loaded.labels[0].backward) backward.push_back(d);
+  for (const auto &[hub, d] : loaded.labels[0].forward)
+    forward.push_back(d);
+  for (const auto &[hub, d] : loaded.labels[0].backward)
+    backward.push_back(d);
   CHECK(forward == distances);
   CHECK(backward == distances);
 }
@@ -267,7 +250,8 @@ void test_parallel_determinism() {
   std::vector<std::tuple<VertexId, VertexId, Distance>> arcs;
   for (VertexId u = 0; u < 25; ++u)
     for (VertexId v = 0; v < 25; ++v)
-      if (u != v && rng() % 7 == 0) arcs.emplace_back(u, v, 1 + rng() % 20);
+      if (u != v && rng() % 7 == 0)
+        arcs.emplace_back(u, v, 1 + rng() % 20);
   auto g = make_graph(25, arcs);
   SamplingOptions a;
   a.initial_trees = 8;
@@ -282,18 +266,15 @@ void test_parallel_determinism() {
   check_exact(g, one.labels);
   check_exact(g, four.labels);
 }
-// Large enough (n=120, so the n/8 small-tree threshold from Appendix A.2 is
-// 15) that SamPG's sampled trees actually shrink across that boundary
-// during the run, exercising the google::sparse_hash_map-backed path in
-// include/sample_tree_storage.h -- not just its dense-array mode, which is
-// all a small graph like the other tests' n=25 reliably reaches.
+
 void test_sparse_tree_storage() {
   std::mt19937 rng(2024);
   std::vector<std::tuple<VertexId, VertexId, Distance>> arcs;
   const VertexId n = 120;
   for (VertexId u = 0; u < n; ++u)
     for (VertexId v = 0; v < n; ++v)
-      if (u != v && rng() % 9 == 0) arcs.emplace_back(u, v, 1 + rng() % 50);
+      if (u != v && rng() % 9 == 0)
+        arcs.emplace_back(u, v, 1 + rng() % 50);
   auto g = make_graph(n, arcs);
   SamplingOptions o;
   o.initial_trees = 32;
@@ -302,8 +283,6 @@ void test_sparse_tree_storage() {
   o.random_seed = 2024;
   auto result = PrunedLabeling::compute(g, o);
   check_exact(g, result.labels);
-  // The real point of this test: confirm the hash-map optimization is wired
-  // in and actually engaging, not merely present as unused code.
   CHECK(result.statistics.sparse_downgrades > 0);
 }
 void test_statistics() {
@@ -330,7 +309,7 @@ int main() {
     test_sparse_tree_storage();
     test_statistics();
     std::cout << "All RXL tests passed\n";
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     std::cerr << e.what() << '\n';
     return 1;
   }
