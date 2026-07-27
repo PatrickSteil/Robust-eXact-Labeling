@@ -66,14 +66,6 @@ constexpr char kGeneralHelp[] =
     "  --seed, -s        seed for the query benchmark (default: 42)\n"
     "  --degree, -d      use degree ordering instead of SamPG\n"
     "  --no-reorder, -r  keep original internal zero-based IDs\n"
-    "  --max-live-trees, -x  <n>\n"
-    "                    cap on concurrently live SamPG sample trees "
-    "(default:\n"
-    "                    1024); every rank pays an O(live trees) cost, so "
-    "this\n"
-    "                    bounds how much a run can slow down on graphs "
-    "where\n"
-    "                    pruning makes trees cheap to build\n"
     "  --min-tree-vertices, -m  <n>\n"
     "                    force-retire a sample tree once it has shrunk to "
     "at\n"
@@ -86,7 +78,7 @@ constexpr char kGeneralHelp[] =
     "Note: the positional [graph] path, if given, must come before any "
     "-- options.";
 
-void print_graph_statistics(const Graph& graph) {
+void print_graph_statistics(const Graph &graph) {
   const auto s = compute_graph_statistics(graph);
   std::cout << "Graph: vertices=" << s.vertices << ", arcs=" << s.arcs
             << ", weighted=" << (graph.is_weighted() ? "yes" : "no")
@@ -95,15 +87,17 @@ void print_graph_statistics(const Graph& graph) {
             << ", isolated=" << s.isolated_vertices << '\n';
 }
 
-void run_benchmark(const HubLabels& labels, std::size_t num_queries,
+void run_benchmark(const HubLabels &labels, std::size_t num_queries,
                    std::size_t threads, const int seed = 42) {
   const std::size_t n = labels.size();
-  if (n == 0) throw std::invalid_argument("cannot benchmark an empty index");
+  if (n == 0)
+    throw std::invalid_argument("cannot benchmark an empty index");
   std::mt19937_64 rng(seed);
   std::uniform_int_distribution<VertexId> dist(0, static_cast<VertexId>(n - 1));
 
   std::vector<std::pair<VertexId, VertexId>> queries(num_queries);
-  for (auto& q : queries) q = {dist(rng), dist(rng)};
+  for (auto &q : queries)
+    q = {dist(rng), dist(rng)};
 
   // Query generation stays serial (so the exact same queries are asked
   // regardless of --threads), and only the timed portion -- independent,
@@ -116,8 +110,9 @@ void run_benchmark(const HubLabels& labels, std::size_t num_queries,
   parallel_for(num_queries, threads, [&](std::size_t lo, std::size_t hi) {
     std::size_t local = 0;
     for (std::size_t i = lo; i < hi; ++i) {
-      const auto& [s, t] = queries[i];
-      if (QuerySupport::distance(labels, s, t) != kInfinity) ++local;
+      const auto &[s, t] = queries[i];
+      if (QuerySupport::distance(labels, s, t) != kInfinity)
+        ++local;
     }
     found += local;
   });
@@ -129,8 +124,8 @@ void run_benchmark(const HubLabels& labels, std::size_t num_queries,
             << ", average-runtime-us=" << avg_us << ", found=" << found << '/'
             << num_queries << '\n';
 }
-}  // namespace
-int main(int argc, char** argv) {
+} // namespace
+int main(int argc, char **argv) {
   if (argc < 2) {
     std::cerr << kGeneralHelp << '\n';
     return 1;
@@ -170,14 +165,12 @@ int main(int argc, char** argv) {
     parser.set_optional<bool>("r", "no-reorder", false,
                               "Keep original internal zero-based IDs");
     parser.set_optional<unsigned long long>(
-        "x", "max-live-trees", 1024,
-        "Cap on concurrently live SamPG sample trees");
-    parser.set_optional<unsigned long long>(
         "m", "min-tree-vertices", 8,
         "Force-retire a sample tree once it has shrunk to at most this "
         "many remaining vertices (0 disables early retirement)");
 
-    if (!parser.run()) return 1;
+    if (!parser.run())
+      return 1;
 
     const std::string positional = parser.get_default<std::string>();
     const std::string format_name = parser.get<std::string>("f");
@@ -193,16 +186,13 @@ int main(int argc, char** argv) {
     const int seed = parser.get<int>("s");
     const bool degree = parser.get<bool>("d");
     const bool reorder = !parser.get<bool>("r");
-    const std::size_t max_live_trees =
-        static_cast<std::size_t>(parser.get<unsigned long long>("x"));
     const std::size_t min_tree_vertices =
         static_cast<std::size_t>(parser.get<unsigned long long>("m"));
 
     if (!benchmark_queries)
       throw std::invalid_argument("--benchmark-queries must be positive");
-    if (!threads) throw std::invalid_argument("--threads must be positive");
-    if (!max_live_trees)
-      throw std::invalid_argument("--max-live-trees must be positive");
+    if (!threads)
+      throw std::invalid_argument("--threads must be positive");
 
     const GraphFormat format = parse_graph_format(format_name);
 
@@ -233,14 +223,15 @@ int main(int argc, char** argv) {
       }
     } else {
       Graph graph(positional, format);
-      if (verbose) print_graph_statistics(graph);
+      if (verbose)
+        print_graph_statistics(graph);
       SamplingOptions options;
       options.num_threads = threads;
       options.verbose = verbose;
-      options.max_live_trees = max_live_trees;
       options.min_tree_vertices = min_tree_vertices;
-      result = degree ? PrunedLabeling::compute_with_degree_order(graph)
-                      : PrunedLabeling::compute(graph, options);
+      result = degree
+                   ? PrunedLabeling::compute_with_degree_order(graph, verbose)
+                   : PrunedLabeling::compute(graph, options);
       if (reorder) {
         graph.reorder_by_rank(result.rank_to_vertex);
         PrunedLabeling::reorder_labels_by_rank(result);
@@ -275,14 +266,15 @@ int main(int argc, char** argv) {
         std::cout << "Exported index to " << export_path << ", encoding="
                   << (encoding == LabelEncoding::Varint ? "varint"
                                                         : "two-block");
-        if (!ec) std::cout << ", bytes=" << bytes;
+        if (!ec)
+          std::cout << ", bytes=" << bytes;
         std::cout << '\n';
       }
     }
     if (do_benchmark) {
       run_benchmark(result.labels, benchmark_queries, threads, seed);
     }
-  } catch (const std::exception& e) {
+  } catch (const std::exception &e) {
     std::cerr << "Error: " << e.what() << '\n';
     return 2;
   }

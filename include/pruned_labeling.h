@@ -2,6 +2,7 @@
 #define PRUNED_LABELING_H
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 
 #include "graph.h"
 #include "hub_label.h"
@@ -13,17 +14,18 @@ struct SamplingOptions {
   std::size_t num_threads = 1;
   std::uint64_t random_seed = 0x5eedULL;
   bool verbose = false;
-  std::size_t max_live_trees = 1024;
+  std::size_t max_live_trees = std::numeric_limits<std::size_t>::max();
   std::size_t min_tree_vertices = 8;
 };
 class PrunedLabeling {
- public:
-  static LabelingResult compute(const Graph&, const SamplingOptions& = {});
-  static LabelingResult compute_with_degree_order(const Graph&);
-  static void reorder_labels_by_rank(LabelingResult&);
+public:
+  static LabelingResult compute(const Graph &, const SamplingOptions & = {});
+  static LabelingResult compute_with_degree_order(const Graph &,
+                                                  const bool verbose = false);
+  static void reorder_labels_by_rank(LabelingResult &);
 
- private:
-  static std::vector<VertexId> degree_order(const Graph&);
+private:
+  static std::vector<VertexId> degree_order(const Graph &);
 };
-}  // namespace rxl
+} // namespace rxl
 #endif
