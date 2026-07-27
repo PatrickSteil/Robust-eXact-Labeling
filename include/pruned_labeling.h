@@ -18,14 +18,14 @@ struct SamplingOptions {
   std::size_t min_tree_vertices = 8;
 };
 class PrunedLabeling {
-public:
-  static LabelingResult compute(const Graph &, const SamplingOptions & = {});
-  static LabelingResult compute_with_degree_order(const Graph &,
+ public:
+  static LabelingResult compute(const Graph&, const SamplingOptions& = {});
+  static LabelingResult compute_with_degree_order(const Graph&,
                                                   const bool verbose = false);
-  static void reorder_labels_by_rank(LabelingResult &);
+  static void reorder_labels_by_rank(LabelingResult&);
 
-private:
-  static std::vector<VertexId> degree_order(const Graph &);
+ private:
+  static std::vector<VertexId> degree_order(const Graph&);
 };
-} // namespace rxl
+}  // namespace rxl
 #endif

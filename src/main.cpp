@@ -17,68 +17,7 @@
 #include "statistics.h"
 using namespace rxl;
 namespace {
-
-constexpr char kGeneralHelp[] =
-    "Usage: rxl_app [graph] [options]\n"
-    "  [graph]           path to the input graph file (see --format); "
-    "optional\n"
-    "                    only when --import is given.\n"
-    "\n"
-    "  --format, -f      input graph file format: dimacs (default), snap, "
-    "metis,\n"
-    "                    or csv. dimacs expects the DIMACS 'p sp'/'a' "
-    "shortest-path\n"
-    "                    format; snap expects SNAP-style 'from to "
-    "[weight]' edge\n"
-    "                    lists; metis expects the METIS 'n m [fmt]' "
-    "adjacency\n"
-    "                    format; csv expects 'from,to,weight' lines "
-    "(weight\n"
-    "                    optional, an optional header row is skipped).\n"
-    "  --export, -e      export labels/rank maps to a binary RXL index\n"
-    "  --label-encoding, -l  <two-block|varint>\n"
-    "                    on-disk hub-id/distance byte packing used by "
-    "--export\n"
-    "                    (default: two-block). two-block is the paper's "
-    "fixed\n"
-    "                    1-byte/4-byte split (Section 4.1); varint packs "
-    "every\n"
-    "                    value as a LEB128 varint (7 payload bits per "
-    "byte, top\n"
-    "                    bit set to mean \"one more byte follows\"), "
-    "often\n"
-    "                    smaller but slower to decode. Ignored without "
-    "--export.\n"
-    "  --import, -i      load labels/rank maps from a binary RXL index "
-    "instead\n"
-    "                    of building them (graph argument then becomes "
-    "optional)\n"
-    "  --benchmark, -b   run a benchmark of random vertex-to-vertex "
-    "queries and\n"
-    "                    report the average query runtime and the number "
-    "of\n"
-    "                    reachable (found) pairs\n"
-    "  --benchmark-queries, -q  <n>\n"
-    "                    number of queries to run with --benchmark "
-    "(default: 10000)\n"
-    "  --verbose, -v     print graph, sampling, and label statistics\n"
-    "  --threads, -t     parallel sample-tree workers (default: 1)\n"
-    "  --seed, -s        seed for the query benchmark (default: 42)\n"
-    "  --degree, -d      use degree ordering instead of SamPG\n"
-    "  --no-reorder, -r  keep original internal zero-based IDs\n"
-    "  --min-tree-vertices, -m  <n>\n"
-    "                    force-retire a sample tree once it has shrunk to "
-    "at\n"
-    "                    most this many remaining vertices, instead of "
-    "waiting\n"
-    "                    for it to reach 0 on its own (default: 8; use 0 "
-    "to\n"
-    "                    disable)\n"
-    "\n"
-    "Note: the positional [graph] path, if given, must come before any "
-    "-- options.";
-
-void print_graph_statistics(const Graph &graph) {
+void print_graph_statistics(const Graph& graph) {
   const auto s = compute_graph_statistics(graph);
   std::cout << "Graph: vertices=" << s.vertices << ", arcs=" << s.arcs
             << ", weighted=" << (graph.is_weighted() ? "yes" : "no")
@@ -87,35 +26,22 @@ void print_graph_statistics(const Graph &graph) {
             << ", isolated=" << s.isolated_vertices << '\n';
 }
 
-void run_benchmark(const HubLabels &labels, std::size_t num_queries,
+void run_benchmark(const HubLabels& labels, std::size_t num_queries,
                    std::size_t threads, const int seed = 42) {
   const std::size_t n = labels.size();
-  if (n == 0)
-    throw std::invalid_argument("cannot benchmark an empty index");
+  if (n == 0) throw std::invalid_argument("cannot benchmark an empty index");
   std::mt19937_64 rng(seed);
   std::uniform_int_distribution<VertexId> dist(0, static_cast<VertexId>(n - 1));
 
   std::vector<std::pair<VertexId, VertexId>> queries(num_queries);
-  for (auto &q : queries)
-    q = {dist(rng), dist(rng)};
+  for (auto& q : queries) q = {dist(rng), dist(rng)};
 
-  // Query generation stays serial (so the exact same queries are asked
-  // regardless of --threads), and only the timed portion -- independent,
-  // read-only lookups against `labels` -- is handed to parallel_for. Each
-  // worker tallies hits in a local (uncontended) counter and folds it into
-  // `found` once per chunk rather than per query, so the shared atomic is
-  // touched O(threads) times, not O(num_queries) times.
-  std::atomic<std::size_t> found{0};
+  std::size_t found{0};
   const auto start = std::chrono::steady_clock::now();
-  parallel_for(num_queries, threads, [&](std::size_t lo, std::size_t hi) {
-    std::size_t local = 0;
-    for (std::size_t i = lo; i < hi; ++i) {
-      const auto &[s, t] = queries[i];
-      if (QuerySupport::distance(labels, s, t) != kInfinity)
-        ++local;
-    }
-    found += local;
-  });
+  for (std::size_t i = 0; i < queries.size(); ++i) {
+    const auto& [s, t] = queries[i];
+    if (QuerySupport::distance(labels, s, t) != kInfinity) ++found;
+  }
   const auto end = std::chrono::steady_clock::now();
   const double total_us =
       std::chrono::duration<double, std::micro>(end - start).count();
@@ -124,14 +50,10 @@ void run_benchmark(const HubLabels &labels, std::size_t num_queries,
             << ", average-runtime-us=" << avg_us << ", found=" << found << '/'
             << num_queries << '\n';
 }
-} // namespace
-int main(int argc, char **argv) {
-  if (argc < 2) {
-    std::cerr << kGeneralHelp << '\n';
-    return 1;
-  }
+}  // namespace
+int main(int argc, char** argv) {
   try {
-    cli::Parser parser(argc, argv, kGeneralHelp);
+    cli::Parser parser(argc, argv);
     parser.set_default<std::string>(
         false, "Input graph file (see --format); optional only with --import",
         "");
@@ -169,8 +91,7 @@ int main(int argc, char **argv) {
         "Force-retire a sample tree once it has shrunk to at most this "
         "many remaining vertices (0 disables early retirement)");
 
-    if (!parser.run())
-      return 1;
+    if (!parser.run()) return 1;
 
     const std::string positional = parser.get_default<std::string>();
     const std::string format_name = parser.get<std::string>("f");
@@ -191,8 +112,7 @@ int main(int argc, char **argv) {
 
     if (!benchmark_queries)
       throw std::invalid_argument("--benchmark-queries must be positive");
-    if (!threads)
-      throw std::invalid_argument("--threads must be positive");
+    if (!threads) throw std::invalid_argument("--threads must be positive");
 
     const GraphFormat format = parse_graph_format(format_name);
 
@@ -223,8 +143,7 @@ int main(int argc, char **argv) {
       }
     } else {
       Graph graph(positional, format);
-      if (verbose)
-        print_graph_statistics(graph);
+      if (verbose) print_graph_statistics(graph);
       SamplingOptions options;
       options.num_threads = threads;
       options.verbose = verbose;
@@ -266,15 +185,14 @@ int main(int argc, char **argv) {
         std::cout << "Exported index to " << export_path << ", encoding="
                   << (encoding == LabelEncoding::Varint ? "varint"
                                                         : "two-block");
-        if (!ec)
-          std::cout << ", bytes=" << bytes;
+        if (!ec) std::cout << ", bytes=" << bytes;
         std::cout << '\n';
       }
     }
     if (do_benchmark) {
       run_benchmark(result.labels, benchmark_queries, threads, seed);
     }
-  } catch (const std::exception &e) {
+  } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << '\n';
     return 2;
   }

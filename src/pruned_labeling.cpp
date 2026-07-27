@@ -1,6 +1,7 @@
 #include "pruned_labeling.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -19,12 +20,13 @@
 
 namespace rxl {
 namespace {
-bool covered(const Label &label, const std::vector<Distance> &root_distance,
+constexpr std::size_t kMaxCounterBuckets = 32;
+
+bool covered(const Label& label, const std::vector<Distance>& root_distance,
              Distance search_distance) {
-  const auto &deltas = label.raw_deltas();
+  const auto& deltas = label.raw_deltas();
   const std::size_t m = deltas.size();
-  if (m == 0)
-    return false;
+  if (m == 0) return false;
 
   constexpr std::size_t kPrefetchAhead = 6;
   VertexId ahead_hub = deltas[0];
@@ -34,41 +36,37 @@ bool covered(const Label &label, const std::vector<Distance> &root_distance,
     if (++ahead_index < m)
       ahead_hub = static_cast<VertexId>(ahead_hub + 1 + deltas[ahead_index]);
   };
-  for (std::size_t k = 0; k < kPrefetchAhead && k < m; ++k)
-    prefetch_next_hub();
+  for (std::size_t k = 0; k < kPrefetchAhead && k < m; ++k) prefetch_next_hub();
 
-  for (const auto &[hub, target_distance] : label) {
-    if (ahead_index < m)
-      prefetch_next_hub();
+  for (const auto& [hub, target_distance] : label) {
+    if (ahead_index < m) prefetch_next_hub();
     const Distance root = root_distance[hub];
-    if (root != kInfinity &&
-        std::uint64_t(root) + target_distance <= search_distance)
-      return true;
+    if (std::uint64_t(root) + target_distance <= search_distance) return true;
   }
   return false;
 }
 
-std::uint64_t pruned_dijkstra(const AdjacencyList &graph, VertexId root,
+std::uint64_t pruned_dijkstra(const AdjacencyList& graph, VertexId root,
                               VertexId hub_id,
-                              const std::vector<Distance> &root_distance,
-                              HubLabels &labels, bool forward,
-                              std::vector<Distance> &distance,
-                              std::vector<VertexId> &touched,
-                              dijkstra_detail::IndexedMinHeap &heap) {
+                              const std::vector<Distance>& root_distance,
+                              HubLabels& labels, bool forward,
+                              std::vector<Distance>& distance,
+                              std::vector<VertexId>& touched,
+                              dijkstra_detail::IndexedMinHeap& heap) {
   std::uint64_t work = 0;
   AbstractDijkstra::search(
       root,
-      [&graph](VertexId u) -> const std::vector<Edge> & { return graph[u]; },
+      [&graph](VertexId u) -> const std::vector<Edge>& { return graph[u]; },
       distance, touched, heap,
       /*on_pop=*/[&](VertexId, Distance) { ++work; },
       /*should_prune=*/
       [&](VertexId u, Distance du) {
-        const Label &query = forward ? labels[u].backward : labels[u].forward;
+        const Label& query = forward ? labels[u].backward : labels[u].forward;
         return covered(query, root_distance, du);
       },
       /*on_settle=*/
       [&](VertexId u, Distance du) {
-        Label &output = forward ? labels[u].backward : labels[u].forward;
+        Label& output = forward ? labels[u].backward : labels[u].forward;
         output.push_back(hub_id, du);
         work += graph[u].size();
       },
@@ -76,24 +74,23 @@ std::uint64_t pruned_dijkstra(const AdjacencyList &graph, VertexId root,
       [&](VertexId, VertexId v, Distance) {
         (forward ? labels[v].backward : labels[v].forward).prefetch();
       });
-  for (VertexId v : touched)
-    distance[v] = kInfinity;
+  for (VertexId v : touched) distance[v] = kInfinity;
   touched.clear();
   return work;
 }
 
-std::uint64_t add_hub(const Graph &graph, VertexId root, VertexId hub_id,
-                      HubLabels &labels, std::vector<Distance> &root_out,
-                      std::vector<Distance> &root_in,
-                      std::vector<Distance> &distance,
-                      std::vector<VertexId> &lookup_touched,
-                      std::vector<VertexId> &search_touched,
-                      dijkstra_detail::IndexedMinHeap &heap) {
-  for (const auto &[hub, d] : labels[root].forward) {
+std::uint64_t add_hub(const Graph& graph, VertexId root, VertexId hub_id,
+                      HubLabels& labels, std::vector<Distance>& root_out,
+                      std::vector<Distance>& root_in,
+                      std::vector<Distance>& distance,
+                      std::vector<VertexId>& lookup_touched,
+                      std::vector<VertexId>& search_touched,
+                      dijkstra_detail::IndexedMinHeap& heap) {
+  for (const auto& [hub, d] : labels[root].forward) {
     root_out[hub] = d;
     lookup_touched.push_back(hub);
   }
-  for (const auto &[hub, d] : labels[root].backward) {
+  for (const auto& [hub, d] : labels[root].backward) {
     root_in[hub] = d;
     lookup_touched.push_back(hub);
   }
@@ -111,14 +108,14 @@ std::uint64_t add_hub(const Graph &graph, VertexId root, VertexId hub_id,
 }
 
 struct SampleTree {
-  SampleTree(std::size_t n, DenseBufferPool &pool) : storage(n, pool) {}
+  SampleTree(std::size_t n, DenseBufferPool& pool) : storage(n, pool) {}
   std::size_t bucket = 0;
   SampleTreeStorage storage;
   std::vector<VertexId> members;
   std::size_t remaining = 0;
   std::size_t list_index = 0;
 
-  void reset(std::size_t n, std::size_t new_bucket, DenseBufferPool &pool) {
+  void reset(std::size_t n, std::size_t new_bucket, DenseBufferPool& pool) {
     storage.reset(n, pool);
     members.clear();
     remaining = 0;
@@ -134,31 +131,31 @@ struct TreeScratch {
   dijkstra_detail::IndexedMinHeap heap;
 };
 
-void build_sample_tree(const Graph &graph, VertexId root,
-                       const HubLabels &labels, std::size_t bucket,
-                       std::uint64_t &work, TreeScratch &scratch,
-                       SampleTree &tree, DenseBufferPool &dense_pool) {
+void build_sample_tree(const Graph& graph, VertexId root,
+                       const HubLabels& labels, std::size_t bucket,
+                       std::uint64_t& work, TreeScratch& scratch,
+                       SampleTree& tree, DenseBufferPool& dense_pool) {
   const std::size_t n = graph.num_vertices();
   if (scratch.root_lookup.size() != n) {
     scratch.root_lookup.assign(n, kInfinity);
     scratch.distance.assign(n, kInfinity);
     scratch.heap.assign(n);
   }
-  auto &root_lookup = scratch.root_lookup;
-  auto &distance = scratch.distance;
-  auto &lookup_touched = scratch.lookup_touched;
-  auto &distance_touched = scratch.distance_touched;
-  auto &heap = scratch.heap;
+  auto& root_lookup = scratch.root_lookup;
+  auto& distance = scratch.distance;
+  auto& lookup_touched = scratch.lookup_touched;
+  auto& distance_touched = scratch.distance_touched;
+  auto& heap = scratch.heap;
 
   tree.reset(n, bucket, dense_pool);
-  for (const auto &[hub, d] : labels[root].forward) {
+  for (const auto& [hub, d] : labels[root].forward) {
     root_lookup[hub] = d;
     lookup_touched.push_back(hub);
   }
-  auto &settled = tree.members;
+  auto& settled = tree.members;
   AbstractDijkstra::search(
       root,
-      [&graph](VertexId u) -> const std::vector<Edge> & {
+      [&graph](VertexId u) -> const std::vector<Edge>& {
         return graph.adjacency()[u];
       },
       distance, distance_touched, heap,
@@ -202,46 +199,43 @@ void build_sample_tree(const Graph &graph, VertexId root,
   tree.remaining = settled.size();
   tree.storage.maybe_downgrade(tree.members, tree.remaining);
 
-  for (VertexId v : distance_touched)
-    distance[v] = kInfinity;
+  for (VertexId v : distance_touched) distance[v] = kInfinity;
   distance_touched.clear();
-  for (VertexId hub : lookup_touched)
-    root_lookup[hub] = kInfinity;
+  for (VertexId hub : lookup_touched) root_lookup[hub] = kInfinity;
   lookup_touched.clear();
 }
 
 template <class TouchFn>
-void add_tree_scores(const SampleTree &tree,
-                     std::vector<std::vector<Score>> &counters,
-                     TouchFn &&touch) {
+void add_tree_scores(const SampleTree& tree, std::size_t buckets,
+                     std::vector<Score>& counters, TouchFn&& touch) {
   for (VertexId v : tree.members) {
     if (tree.storage.alive(v)) {
-      counters[v][tree.bucket] += tree.storage.subtree_of(v);
+      counters[static_cast<std::size_t>(v) * buckets + tree.bucket] +=
+          tree.storage.subtree_of(v);
       touch(v);
     }
   }
 }
 
-void register_membership(SampleTree *tree,
-                         std::vector<std::vector<SampleTree *>> &membership) {
+void register_membership(SampleTree* tree,
+                         std::vector<std::vector<SampleTree*>>& membership) {
   for (VertexId v : tree->members)
-    if (tree->storage.alive(v))
-      membership[v].push_back(tree);
+    if (tree->storage.alive(v)) membership[v].push_back(tree);
 }
 
 template <class TouchFn>
-std::size_t remove_subtree(SampleTree &tree, VertexId hub,
-                           std::vector<std::vector<Score>> &counters,
-                           bool &downgraded, TouchFn &&touch,
-                           std::vector<std::vector<SampleTree *>> &membership) {
+std::size_t remove_subtree(SampleTree& tree, VertexId hub, std::size_t buckets,
+                           std::vector<Score>& counters, bool& downgraded,
+                           TouchFn&& touch,
+                           std::vector<std::vector<SampleTree*>>& membership) {
   downgraded = false;
-  auto &storage = tree.storage;
-  if (!storage.alive(hub))
-    return 0;
+  auto& storage = tree.storage;
+  if (!storage.alive(hub)) return 0;
   const Score removed = storage.subtree_of(hub);
   VertexId ancestor = storage.parent_of(hub);
   while (ancestor != kInvalidVertex && storage.alive(ancestor)) {
-    counters[ancestor][tree.bucket] -= removed;
+    counters[static_cast<std::size_t>(ancestor) * buckets + tree.bucket] -=
+        removed;
     storage.set_subtree(ancestor, storage.subtree_of(ancestor) - removed);
     touch(ancestor);
     ancestor = storage.parent_of(ancestor);
@@ -250,13 +244,13 @@ std::size_t remove_subtree(SampleTree &tree, VertexId hub,
   while (!stack.empty()) {
     const VertexId v = stack.back();
     stack.pop_back();
-    if (!storage.alive(v))
-      continue;
-    counters[v][tree.bucket] -= storage.subtree_of(v);
+    if (!storage.alive(v)) continue;
+    counters[static_cast<std::size_t>(v) * buckets + tree.bucket] -=
+        storage.subtree_of(v);
     touch(v);
     const std::vector<VertexId> children = storage.children_of(v);
     storage.deactivate(v);
-    auto &lst = membership[v];
+    auto& lst = membership[v];
     for (std::size_t i = 0; i < lst.size(); ++i) {
       if (lst[i] == &tree) {
         lst[i] = lst.back();
@@ -264,8 +258,7 @@ std::size_t remove_subtree(SampleTree &tree, VertexId hub,
         break;
       }
     }
-    for (VertexId child : children)
-      stack.push_back(child);
+    for (VertexId child : children) stack.push_back(child);
   }
   tree.remaining -= static_cast<std::size_t>(removed);
   downgraded = storage.maybe_downgrade(tree.members, tree.remaining);
@@ -273,25 +266,23 @@ std::size_t remove_subtree(SampleTree &tree, VertexId hub,
 }
 
 template <class TouchFn>
-void retire_remaining(SampleTree &tree,
-                      std::vector<std::vector<Score>> &counters,
-                      std::size_t &live_vertices, TouchFn &&touch,
-                      std::vector<std::vector<SampleTree *>> &membership) {
+void retire_remaining(SampleTree& tree, std::size_t buckets,
+                      std::vector<Score>& counters, std::size_t& live_vertices,
+                      TouchFn&& touch,
+                      std::vector<std::vector<SampleTree*>>& membership) {
   for (VertexId v : tree.members) {
-    if (!tree.storage.alive(v))
-      continue;
+    if (!tree.storage.alive(v)) continue;
     const VertexId parent = tree.storage.parent_of(v);
-    if (parent != kInvalidVertex && tree.storage.alive(parent))
-      continue;
+    if (parent != kInvalidVertex && tree.storage.alive(parent)) continue;
     bool downgraded = false;
-    live_vertices -=
-        remove_subtree(tree, v, counters, downgraded, touch, membership);
+    live_vertices -= remove_subtree(tree, v, buckets, counters, downgraded,
+                                    touch, membership);
   }
 }
 
 void retire_tree(std::size_t idx,
-                 std::vector<std::unique_ptr<SampleTree>> &trees,
-                 std::vector<std::unique_ptr<SampleTree>> &tree_pool) {
+                 std::vector<std::unique_ptr<SampleTree>>& trees,
+                 std::vector<std::unique_ptr<SampleTree>>& tree_pool) {
   tree_pool.push_back(std::move(trees[idx]));
   const std::size_t last = trees.size() - 1;
   if (idx != last) {
@@ -301,23 +292,25 @@ void retire_tree(std::size_t idx,
   trees.pop_back();
 }
 
-std::pair<Score, Score> priority(const std::vector<Score> &counter,
-                                 std::size_t discard,
-                                 std::vector<Score> &scratch) {
-  scratch.assign(counter.begin(), counter.end());
-  std::sort(scratch.begin(), scratch.end(), std::greater<Score>());
-  discard = std::min(discard, scratch.size());
-  Score robust = 0, total = 0;
-  for (Score value : counter)
-    total += value;
-  for (std::size_t i = discard; i < scratch.size(); ++i)
-    robust += scratch[i];
+std::pair<Score, Score> priority(const Score* counter, std::size_t buckets,
+                                 std::size_t discard) {
+  std::array<Score, kMaxCounterBuckets> scratch;
+  std::copy(counter, counter + buckets, scratch.begin());
+  const Score total = std::accumulate(counter, counter + buckets, Score(0));
+
+  discard = std::min(discard, buckets);
+  if (discard > 0) {
+    std::nth_element(scratch.begin(), scratch.begin() + (discard - 1),
+                     scratch.begin() + buckets, std::greater<Score>());
+  }
+  const Score robust = std::accumulate(scratch.begin() + discard,
+                                       scratch.begin() + buckets, Score(0));
   return {robust, total};
 }
 
-std::vector<VertexId> sampled_order(const Graph &graph,
-                                    const SamplingOptions &options,
-                                    HubLabels &labels, BuildStatistics &stats) {
+std::vector<VertexId> sampled_order(const Graph& graph,
+                                    const SamplingOptions& options,
+                                    HubLabels& labels, BuildStatistics& stats) {
   const std::size_t n = graph.num_vertices();
   const std::size_t buckets = std::max<std::size_t>(1, options.counter_buckets);
   const std::size_t initial =
@@ -338,9 +331,9 @@ std::vector<VertexId> sampled_order(const Graph &graph,
     }
     return std::make_unique<SampleTree>(n, dense_pool);
   };
-  std::vector<std::vector<Score>> counters(n, std::vector<Score>(buckets, 0));
+  std::vector<Score> counters(n * buckets, Score(0));
 
-  std::vector<std::vector<SampleTree *>> membership(n);
+  std::vector<std::vector<SampleTree*>> membership(n);
 
   std::vector<std::size_t> degree(n);
   for (VertexId v = 0; v < n; ++v)
@@ -350,11 +343,11 @@ std::vector<VertexId> sampled_order(const Graph &graph,
 
   std::vector<Score> priority_scratch;
   AddressableHeap heap(n);
+
   auto touch = [&](VertexId v) {
-    if (selected[v])
-      return;
-    const auto p =
-        priority(counters[v], options.discarded_max_buckets, priority_scratch);
+    if (selected[v]) return;
+    const auto p = priority(&counters[static_cast<std::size_t>(v) * buckets],
+                            buckets, options.discarded_max_buckets);
     heap.set(v, p.first, p.second, degree[v]);
   };
 
@@ -362,7 +355,7 @@ std::vector<VertexId> sampled_order(const Graph &graph,
   const std::size_t threads = std::max<std::size_t>(1, options.num_threads);
   std::size_t live_vertices = 0;
   std::vector<TreeScratch> scratch_pool(threads);
-  auto grow_batch = [&](const std::vector<VertexId> &batch_roots,
+  auto grow_batch = [&](const std::vector<VertexId>& batch_roots,
                         std::size_t first_bucket) {
     using Built = std::pair<std::unique_ptr<SampleTree>, std::uint64_t>;
     std::vector<Built> built;
@@ -386,11 +379,11 @@ std::vector<VertexId> sampled_order(const Graph &graph,
       for (std::size_t i = 0; i < batch_roots.size(); ++i) {
         const VertexId root = batch_roots[i];
         const std::size_t bucket = (first_bucket + i) % buckets;
-        TreeScratch &lane = scratch_pool[i];
-        SampleTree &tree_ref = *lane_trees[i];
-        futures.emplace_back(
-            std::async(std::launch::async, [&graph, &labels, &lane, &tree_ref,
-                                            root, bucket, &dense_pool] {
+        TreeScratch& lane = scratch_pool[i];
+        SampleTree& tree_ref = *lane_trees[i];
+        futures.emplace_back(std::async(
+            std::launch::async,
+            [&graph, &labels, &lane, &tree_ref, root, bucket, &dense_pool] {
               std::uint64_t work = 0;
               build_sample_tree(graph, root, labels, bucket, work, lane,
                                 tree_ref, dense_pool);
@@ -402,14 +395,13 @@ std::vector<VertexId> sampled_order(const Graph &graph,
         built.emplace_back(std::move(lane_trees[i]), work);
       }
     }
-    for (auto &item : built) {
+    for (auto& item : built) {
       tree_work += item.second;
       stats.sampling_work += item.second;
-      add_tree_scores(*item.first, counters, touch);
+      add_tree_scores(*item.first, buckets, counters, touch);
       register_membership(item.first.get(), membership);
       live_vertices += item.first->remaining;
-      if (!item.first->storage.is_dense())
-        ++stats.sparse_downgrades;
+      if (!item.first->storage.is_dense()) ++stats.sparse_downgrades;
       trees.push_back(std::move(item.first));
       trees.back()->list_index = trees.size() - 1;
       ++stats.sampled_trees;
@@ -424,8 +416,7 @@ std::vector<VertexId> sampled_order(const Graph &graph,
   tree_work = 0;
 
   for (VertexId v = 0; v < n; ++v)
-    if (!heap.contains(v))
-      touch(v);
+    if (!heap.contains(v)) touch(v);
 
   std::vector<VertexId> order;
   order.reserve(n);
@@ -458,16 +449,16 @@ std::vector<VertexId> sampled_order(const Graph &graph,
                 << ": selected vertex " << best << ", live trees "
                 << trees.size() << "\n";
 
-    const std::vector<SampleTree *> containing_best = membership[best];
-    for (SampleTree *tree_ptr : containing_best) {
+    const std::vector<SampleTree*> containing_best = membership[best];
+    for (SampleTree* tree_ptr : containing_best) {
       bool downgraded = false;
-      live_vertices -= remove_subtree(*tree_ptr, best, counters, downgraded,
-                                      touch, membership);
-      if (downgraded)
-        ++stats.sparse_downgrades;
+      live_vertices -= remove_subtree(*tree_ptr, best, buckets, counters,
+                                      downgraded, touch, membership);
+      if (downgraded) ++stats.sparse_downgrades;
       if (tree_ptr->remaining > 0 &&
           tree_ptr->remaining <= options.min_tree_vertices)
-        retire_remaining(*tree_ptr, counters, live_vertices, touch, membership);
+        retire_remaining(*tree_ptr, buckets, counters, live_vertices, touch,
+                         membership);
       if (tree_ptr->remaining == 0)
         retire_tree(tree_ptr->list_index, trees, tree_pool);
     }
@@ -485,11 +476,9 @@ std::vector<VertexId> sampled_order(const Graph &graph,
         }
         const VertexId root = roots[next_root++];
         ++attempts;
-        if (!selected[root])
-          batch.push_back(root);
+        if (!selected[root]) batch.push_back(root);
       }
-      if (batch.empty())
-        break;
+      if (batch.empty()) break;
       grow_batch(batch, trees.size() % buckets);
     }
     stats.peak_live_trees = std::max(stats.peak_live_trees, trees.size());
@@ -500,13 +489,12 @@ std::vector<VertexId> sampled_order(const Graph &graph,
 
 LabelingResult finish(HubLabels labels, std::vector<VertexId> order) {
   std::vector<Rank> ranks(order.size());
-  for (Rank rank = 0; rank < order.size(); ++rank)
-    ranks[order[rank]] = rank;
+  for (Rank rank = 0; rank < order.size(); ++rank) ranks[order[rank]] = rank;
   return {std::move(labels), std::move(order), std::move(ranks), {}};
 }
-} // namespace
+}  // namespace
 
-std::vector<VertexId> PrunedLabeling::degree_order(const Graph &graph) {
+std::vector<VertexId> PrunedLabeling::degree_order(const Graph& graph) {
   std::vector<VertexId> order(graph.num_vertices());
   std::iota(order.begin(), order.end(), VertexId{0});
   std::sort(order.begin(), order.end(), [&](VertexId a, VertexId b) {
@@ -519,7 +507,7 @@ std::vector<VertexId> PrunedLabeling::degree_order(const Graph &graph) {
   return order;
 }
 
-LabelingResult PrunedLabeling::compute_with_degree_order(const Graph &graph,
+LabelingResult PrunedLabeling::compute_with_degree_order(const Graph& graph,
                                                          const bool verbose) {
   const std::size_t n = graph.num_vertices();
   HubLabels labels(n);
@@ -540,13 +528,15 @@ LabelingResult PrunedLabeling::compute_with_degree_order(const Graph &graph,
   return finish(std::move(labels), std::move(order));
 }
 
-LabelingResult PrunedLabeling::compute(const Graph &graph,
-                                       const SamplingOptions &options) {
-  if (options.initial_trees == 0)
-    return compute_with_degree_order(graph);
+LabelingResult PrunedLabeling::compute(const Graph& graph,
+                                       const SamplingOptions& options) {
+  if (options.initial_trees == 0) return compute_with_degree_order(graph);
   if (options.discarded_max_buckets >= options.counter_buckets)
     throw std::invalid_argument(
         "SamPG must retain at least one counter bucket");
+  if (options.counter_buckets > kMaxCounterBuckets)
+    throw std::invalid_argument(
+        "SamPG: counter_buckets exceeds the supported maximum");
   HubLabels labels(graph.num_vertices());
   BuildStatistics statistics;
   const auto start = std::chrono::steady_clock::now();
@@ -559,7 +549,7 @@ LabelingResult PrunedLabeling::compute(const Graph &graph,
   return result;
 }
 
-void PrunedLabeling::reorder_labels_by_rank(LabelingResult &result) {
+void PrunedLabeling::reorder_labels_by_rank(LabelingResult& result) {
   const std::size_t n = result.labels.size();
   if (result.rank_to_vertex.size() != n || result.vertex_to_rank.size() != n)
     throw std::invalid_argument("Incomplete rank information");
@@ -576,4 +566,4 @@ void PrunedLabeling::reorder_labels_by_rank(LabelingResult &result) {
   result.labels = std::move(reordered);
   result.rank_reordered = true;
 }
-} // namespace rxl
+}  // namespace rxl

@@ -13,7 +13,7 @@ using Rank = std::uint32_t;
 using Score = std::uint64_t;
 
 constexpr VertexId kInvalidVertex = std::numeric_limits<VertexId>::max();
-constexpr Distance kInfinity = std::numeric_limits<Distance>::max();
+constexpr Distance kInfinity = std::numeric_limits<Distance>::max() / 2;
 
 using Edge = std::pair<VertexId, Distance>;
 using AdjacencyList = std::vector<std::vector<Edge>>;

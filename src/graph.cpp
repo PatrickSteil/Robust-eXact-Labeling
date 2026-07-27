@@ -11,9 +11,8 @@
 
 namespace rxl {
 namespace {
-// Splits a line on any of `delimiters`, dropping empty fields (so repeated
-// whitespace is collapsed the way operator>> on a stream would do).
-std::vector<std::string> split(const std::string& line, const char* delimiters) {
+std::vector<std::string> split(const std::string& line,
+                               const char* delimiters) {
   std::vector<std::string> fields;
   std::size_t pos = 0;
   while (pos < line.size()) {
@@ -42,9 +41,8 @@ GraphFormat parse_graph_format(const std::string& name) {
   if (name == "metis") return GraphFormat::Metis;
   if (name == "csv" || name == "edgelist" || name == "edge-list")
     return GraphFormat::EdgeList;
-  throw std::invalid_argument(
-      "Unknown graph format '" + name +
-      "' (expected: dimacs, snap, metis, csv)");
+  throw std::invalid_argument("Unknown graph format '" + name +
+                              "' (expected: dimacs, snap, metis, csv)");
 }
 
 Graph::Graph(const std::string& file, GraphFormat format) {
@@ -113,7 +111,8 @@ void Graph::load_snap(const std::string& file) {
   std::unordered_map<std::uint64_t, VertexId> id_map;
   std::vector<std::array<std::uint64_t, 3>> raw_edges;  // from, to, weight
   auto intern = [&](std::uint64_t raw) -> VertexId {
-    auto [it, inserted] = id_map.try_emplace(raw, static_cast<VertexId>(id_map.size()));
+    auto [it, inserted] =
+        id_map.try_emplace(raw, static_cast<VertexId>(id_map.size()));
     if (inserted && id_map.size() - 1 > kInvalidVertex)
       throw std::runtime_error("SNAP file has too many distinct vertex IDs");
     return it->second;
@@ -168,11 +167,13 @@ void Graph::load_metis(const std::string& file) {
       m = parse_uint(fields[1], "METIS header");
       if (n > kInvalidVertex)
         throw std::runtime_error("METIS graph has too many vertices");
-      if (fields.size() >= 3) fmt = static_cast<int>(parse_uint(fields[2], "METIS header"));
+      if (fields.size() >= 3)
+        fmt = static_cast<int>(parse_uint(fields[2], "METIS header"));
       if (fmt != 0 && fmt != 1)
         throw std::runtime_error(
             "Unsupported METIS fmt (only unweighted '0' or edge-weighted "
-            "'1' are supported): " + fields[2]);
+            "'1' are supported): " +
+            fields[2]);
       adjacency_.assign(static_cast<std::size_t>(n), {});
       saw_header = true;
       continue;
@@ -183,8 +184,8 @@ void Graph::load_metis(const std::string& file) {
     const bool weighted = fmt == 1;
     const auto fields = split(line, " \t");
     if (weighted && fields.size() % 2 != 0)
-      throw std::runtime_error(
-          "Malformed METIS weighted adjacency line: " + line);
+      throw std::runtime_error("Malformed METIS weighted adjacency line: " +
+                               line);
     for (std::size_t i = 0; i < fields.size(); i += weighted ? 2 : 1) {
       const std::uint64_t to = parse_uint(fields[i], "METIS adjacency line");
       const std::uint64_t weight =
@@ -212,7 +213,8 @@ void Graph::load_edge_list(const std::string& file) {
   std::unordered_map<std::uint64_t, VertexId> id_map;
   std::vector<std::array<std::uint64_t, 3>> raw_edges;
   auto intern = [&](std::uint64_t raw) -> VertexId {
-    auto [it, inserted] = id_map.try_emplace(raw, static_cast<VertexId>(id_map.size()));
+    auto [it, inserted] =
+        id_map.try_emplace(raw, static_cast<VertexId>(id_map.size()));
     if (inserted && id_map.size() - 1 > kInvalidVertex)
       throw std::runtime_error("CSV file has too many distinct vertex IDs");
     return it->second;
@@ -228,7 +230,8 @@ void Graph::load_edge_list(const std::string& file) {
     for (auto& field : fields) {
       const auto begin = field.find_first_not_of(" \t");
       const auto end = field.find_last_not_of(" \t");
-      field = begin == std::string::npos ? "" : field.substr(begin, end - begin + 1);
+      field = begin == std::string::npos ? ""
+                                         : field.substr(begin, end - begin + 1);
     }
     if (first_line) {
       first_line = false;

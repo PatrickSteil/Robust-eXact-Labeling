@@ -10,20 +10,20 @@
 
 namespace rxl {
 class DeltaLabel {
-public:
+ public:
   using Entry = std::pair<VertexId, Distance>;
 
   class const_iterator {
-  public:
+   public:
     using iterator_category = std::input_iterator_tag;
     using value_type = Entry;
     using difference_type = std::ptrdiff_t;
-    using pointer = const Entry *;
+    using pointer = const Entry*;
     using reference = Entry;
 
     reference operator*() const { return {current_hub_, current_distance_}; }
 
-    const_iterator &operator++() {
+    const_iterator& operator++() {
       ++index_;
       if (index_ < label_->deltas_.size()) {
         current_hub_ =
@@ -41,16 +41,16 @@ public:
       ++(*this);
       return tmp;
     }
-    bool operator==(const const_iterator &other) const {
+    bool operator==(const const_iterator& other) const {
       return label_ == other.label_ && index_ == other.index_;
     }
-    bool operator!=(const const_iterator &other) const {
+    bool operator!=(const const_iterator& other) const {
       return !(*this == other);
     }
 
-  private:
+   private:
     friend class DeltaLabel;
-    const_iterator(const DeltaLabel *label, std::size_t index,
+    const_iterator(const DeltaLabel* label, std::size_t index,
                    VertexId current_hub)
         : label_(label), index_(index), current_hub_(current_hub) {
       if (index_ < label_->deltas_.size()) {
@@ -63,7 +63,7 @@ public:
         run_remaining_ = 0;
       }
     }
-    const DeltaLabel *label_;
+    const DeltaLabel* label_;
     std::size_t index_;
     VertexId current_hub_;
     std::size_t run_index_;
@@ -76,8 +76,9 @@ public:
 
   void push_back(VertexId hub, Distance distance) {
     if (hub == kInvalidVertex)
-      throw std::invalid_argument("DeltaLabel: hub id must not be "
-                                  "kInvalidVertex");
+      throw std::invalid_argument(
+          "DeltaLabel: hub id must not be "
+          "kInvalidVertex");
     if (hub < next_min_hub_)
       throw std::invalid_argument(
           "DeltaLabel: hub ids must be inserted in strictly increasing "
@@ -97,12 +98,9 @@ public:
 
   void prefetch() const {
 #if defined(__GNUC__) || defined(__clang__)
-    if (!deltas_.empty())
-      __builtin_prefetch(deltas_.data(), 0, 1);
-    if (!run_values_.empty())
-      __builtin_prefetch(run_values_.data(), 0, 1);
-    if (!run_lengths_.empty())
-      __builtin_prefetch(run_lengths_.data(), 0, 1);
+    __builtin_prefetch(deltas_.data(), 0, 1);
+    __builtin_prefetch(run_values_.data(), 0, 1);
+    __builtin_prefetch(run_lengths_.data(), 0, 1);
 #endif
   }
 
@@ -111,9 +109,9 @@ public:
   }
   const_iterator end() const { return const_iterator(this, deltas_.size(), 0); }
 
-  const std::vector<VertexId> &raw_deltas() const { return deltas_; }
-  const std::vector<Distance> &raw_run_values() const { return run_values_; }
-  const std::vector<std::uint32_t> &raw_run_lengths() const {
+  const std::vector<VertexId>& raw_deltas() const { return deltas_; }
+  const std::vector<Distance>& raw_run_values() const { return run_values_; }
+  const std::vector<std::uint32_t>& raw_run_lengths() const {
     return run_lengths_;
   }
   std::vector<Distance> raw_distances() const {
@@ -141,8 +139,7 @@ public:
       next_min = hub + 1;
     }
     label.deltas_ = std::move(deltas);
-    for (const Distance d : distances)
-      label.extend_or_start_run(d);
+    for (const Distance d : distances) label.extend_or_start_run(d);
     label.next_min_hub_ = static_cast<VertexId>(next_min);
     return label;
   }
@@ -178,7 +175,7 @@ public:
     return label;
   }
 
-private:
+ private:
   void extend_or_start_run(Distance distance) {
     if (!run_lengths_.empty() && run_values_.back() == distance &&
         run_lengths_.back() < std::numeric_limits<std::uint32_t>::max()) {
@@ -198,5 +195,5 @@ private:
 using LabelEntry = DeltaLabel::Entry;
 using Label = DeltaLabel;
 
-} // namespace rxl
+}  // namespace rxl
 #endif
