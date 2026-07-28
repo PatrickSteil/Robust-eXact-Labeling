@@ -8,19 +8,18 @@ namespace rxl {
 CsrAdjacency::CsrAdjacency(AdjacencyList lists) {
   const std::size_t n = lists.size();
   offsets_.assign(n + 1, 0);
-  for (std::size_t u = 0; u < n; ++u) offsets_[u + 1] = offsets_[u] + lists[u].size();
+  for (std::size_t u = 0; u < n; ++u)
+    offsets_[u + 1] = offsets_[u] + lists[u].size();
   edges_.resize(offsets_[n]);
   for (std::size_t u = 0; u < n; ++u) {
     std::move(lists[u].begin(), lists[u].end(),
-             edges_.begin() + static_cast<std::ptrdiff_t>(offsets_[u]));
-    // Release this vertex's builder vector immediately rather than waiting
-    // for `lists` to go out of scope, so it doesn't sit alongside the CSR
-    // arrays for the rest of construction.
+              edges_.begin() + static_cast<std::ptrdiff_t>(offsets_[u]));
     std::vector<Edge>().swap(lists[u]);
   }
 }
 
-CsrAdjacency::CsrAdjacency(std::vector<Edge> edges, std::vector<std::size_t> offsets)
+CsrAdjacency::CsrAdjacency(std::vector<Edge> edges,
+                           std::vector<std::size_t> offsets)
     : edges_(std::move(edges)), offsets_(std::move(offsets)) {}
 
 CsrAdjacency CsrAdjacency::reversed() const {

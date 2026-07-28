@@ -6,6 +6,16 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+include(CheckIPOSupported)
+check_ipo_supported(RESULT ipo_supported OUTPUT ipo_error)
+
+if(ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO TRUE)
+else()
+    message(WARNING "IPO/LTO not supported: ${ipo_error}")
+endif()
+
 find_package(Threads REQUIRED)
 
 add_library(rxl
@@ -45,7 +55,20 @@ target_include_directories(benchmark PRIVATE third_party/cmdparser)
 include(CTest)
 
 if(BUILD_TESTING)
-  add_executable(tests tests/test_main.cpp)
+  add_executable(tests 
+    tests/test_main.cpp
+    tests/test_delta_label.cpp
+    tests/test_directed_weighted.cpp
+    tests/test_rank_reorder.cpp
+    tests/test_hub_ids_are_ranks.cpp
+    tests/test_export_roundtrip.cpp
+    tests/test_default_encoding.cpp
+    tests/test_varint_encoding.cpp
+    tests/test_parallel_determinism.cpp
+    tests/test_sparse_tree_storage.cpp
+    tests/test_statistics.cpp
+  )
   target_link_libraries(tests PRIVATE rxl)
-  add_test(NAME rxl_unit_tests COMMAND rxl_tests)
+  target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME rxl_unit_tests COMMAND tests)
 endif()

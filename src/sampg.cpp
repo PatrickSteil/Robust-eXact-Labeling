@@ -14,6 +14,7 @@
 #include "abstract_dijkstra.h"
 #include "addressable_heap.h"
 #include "indexed_minheap.h"
+#include "parallel_for.h"
 #include "pruned_dijkstra.h"
 #include "sample_tree_storage.h"
 
@@ -84,9 +85,6 @@ void build_sample_tree(const Graph& graph, VertexId root,
       /*on_relax=*/
       [&](VertexId u, VertexId v, Distance) {
         tree.storage.set_parent(v, u);
-        // Same rationale as HubExpansion's pruned_dijkstra on_relax: warm
-        // up v's backward label now, ahead of the should_prune call that
-        // will read it once v reaches the front of the heap.
         labels[v].backward.prefetch();
       },
       /*on_non_improving_edge=*/
@@ -257,9 +255,13 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
   std::vector<std::vector<SampleTree*>> membership(n);
 
   std::vector<std::size_t> degree(n);
-  for (VertexId v = 0; v < n; ++v)
-    degree[v] =
-        graph.adjacency()[v].size() + graph.reverse_adjacency()[v].size();
+  parallel_for(n, options.num_threads,
+               [&graph, &degree](const auto left, const auto right) {
+                 for (VertexId v = left; v < right; ++v) {
+                   degree[v] = graph.adjacency()[v].size() +
+                               graph.reverse_adjacency()[v].size();
+                 }
+               });
   std::vector<std::uint8_t> selected(n, 0);
 
   std::vector<Score> priority_scratch;

@@ -1,6 +1,6 @@
-#include <utility>
-
 #include "addressable_heap.h"
+
+#include <utility>
 
 namespace rxl {
 

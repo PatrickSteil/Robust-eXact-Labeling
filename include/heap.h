@@ -21,9 +21,6 @@ class AddressableHeap {
   bool empty() const { return heap_.empty(); }
   bool contains(VertexId v) const { return position_[v] != kInvalidPos; }
 
-  // Inserts v with the given key if it isn't present yet, or updates its
-  // key in place (sifting up or down as needed -- a key can move either
-  // direction, see the class comment) if it already is. O(log n).
   void set(VertexId v, Score robust, Score total, std::size_t degree) {
     if (position_[v] == kInvalidPos) {
       const std::size_t i = heap_.size();
@@ -37,8 +34,6 @@ class AddressableHeap {
     }
   }
 
-  // Removes and returns the vertex with the highest priority. O(log n).
-  // Precondition: !empty().
   VertexId pop_top() {
     const VertexId top = heap_[0].v;
     remove_at(0);
@@ -102,8 +97,6 @@ class AddressableHeap {
   }
 
   std::vector<HeapEntry> heap_;
-  // Per-vertex index into heap_, or kInvalidPos if v has no live entry
-  // (either never touched yet, or already selected and popped).
   std::vector<std::size_t> position_;
 };
 

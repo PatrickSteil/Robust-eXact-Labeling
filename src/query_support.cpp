@@ -5,17 +5,11 @@
 namespace rxl {
 Distance QuerySupport::distance(const HubLabels& labels, VertexId source,
                                 VertexId target) {
-  if (source >= labels.size() || target >= labels.size()) return kInfinity;
+  if (source >= labels.size() || target >= labels.size()) [[unlikely]]
+    return kInfinity;
   const auto& out = labels[source].forward;
   const auto& in = labels[target].backward;
   Distance answer = kInfinity;
-  // Both labels are DeltaLabel, which only supports a forward, ascending
-  // sweep (decoding entry i costs O(i) in isolation, since hub ids are
-  // stored as gaps from the previous one -- see delta_label.h). That is
-  // exactly what this coordinated sweep needs anyway: the paper describes
-  // the HL query as a mergesort-style walk over both labels (Section 2), so
-  // we walk both with iterators instead of indices, advancing whichever
-  // side currently has the smaller hub id.
   auto i = out.begin();
   const auto i_end = out.end();
   auto j = in.begin();

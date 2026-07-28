@@ -31,13 +31,12 @@ bool HubExpansion::covered(const Label& label,
 
 std::uint64_t HubExpansion::pruned_dijkstra(
     const CsrAdjacency& graph, VertexId root, VertexId hub_id,
-    const std::vector<Distance>& root_distance, HubLabels& labels,
-    bool forward, std::vector<Distance>& distance,
-    std::vector<VertexId>& touched, dijkstra_detail::IndexedMinHeap& heap) {
+    const std::vector<Distance>& root_distance, HubLabels& labels, bool forward,
+    std::vector<Distance>& distance, std::vector<VertexId>& touched,
+    dijkstra_detail::IndexedMinHeap& heap) {
   std::uint64_t work = 0;
   AbstractDijkstra::search(
-      root, [&graph](VertexId u) { return graph[u]; }, distance, touched,
-      heap,
+      root, [&graph](VertexId u) { return graph[u]; }, distance, touched, heap,
       /*on_pop=*/[&](VertexId, Distance) { ++work; },
       /*should_prune=*/
       [&](VertexId u, Distance du) {
@@ -59,12 +58,14 @@ std::uint64_t HubExpansion::pruned_dijkstra(
   return work;
 }
 
-std::uint64_t HubExpansion::add_hub(
-    const Graph& graph, VertexId root, VertexId hub_id, HubLabels& labels,
-    std::vector<Distance>& root_out, std::vector<Distance>& root_in,
-    std::vector<Distance>& distance, std::vector<VertexId>& lookup_touched,
-    std::vector<VertexId>& search_touched,
-    dijkstra_detail::IndexedMinHeap& heap) {
+std::uint64_t HubExpansion::add_hub(const Graph& graph, VertexId root,
+                                    VertexId hub_id, HubLabels& labels,
+                                    std::vector<Distance>& root_out,
+                                    std::vector<Distance>& root_in,
+                                    std::vector<Distance>& distance,
+                                    std::vector<VertexId>& lookup_touched,
+                                    std::vector<VertexId>& search_touched,
+                                    dijkstra_detail::IndexedMinHeap& heap) {
   for (const auto& [hub, d] : labels[root].forward) {
     root_out[hub] = d;
     lookup_touched.push_back(hub);
