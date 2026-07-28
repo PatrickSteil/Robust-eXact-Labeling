@@ -9,9 +9,12 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Threads REQUIRED)
 
 add_library(rxl
+  src/csr_graph.cpp
   src/graph.cpp
   src/dijkstra.cpp
   src/addressable_heap.cpp
+  src/pruned_dijkstra.cpp
+  src/sampg.cpp
   src/pruned_labeling.cpp
   src/query_support.cpp
   src/index_io.cpp

@@ -1,22 +1,19 @@
 #ifndef PRUNED_LABELING_H
 #define PRUNED_LABELING_H
-#include <cstddef>
-#include <cstdint>
-#include <limits>
+#include <vector>
 
 #include "graph.h"
 #include "hub_label.h"
+#include "sampg.h"
+
 namespace rxl {
-struct SamplingOptions {
-  std::size_t initial_trees = 64;
-  std::size_t counter_buckets = 16;
-  std::size_t discarded_max_buckets = 2;
-  std::size_t num_threads = 1;
-  std::uint64_t random_seed = 0x5eedULL;
-  bool verbose = false;
-  std::size_t max_live_trees = std::numeric_limits<std::size_t>::max();
-  std::size_t min_tree_vertices = 8;
-};
+
+// The two vertex-ordering strategies this project supports, unified behind
+// one entry point: SamPG (compute(), the default -- see sampg.h) and plain
+// descending degree order (compute_with_degree_order(), mainly useful as a
+// baseline). Both build a full hub-labeling via the same underlying
+// pruned-Dijkstra hub expansion (HubExpansion::add_hub, pruned_dijkstra.h);
+// they differ only in which order they promote vertices to hubs.
 class PrunedLabeling {
  public:
   static LabelingResult compute(const Graph&, const SamplingOptions& = {});

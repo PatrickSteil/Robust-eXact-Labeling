@@ -48,25 +48,24 @@ GraphFormat parse_graph_format(const std::string& name) {
 Graph::Graph(const std::string& file, GraphFormat format) {
   switch (format) {
     case GraphFormat::Dimacs:
-      load_dimacs(file);
+      finalize(load_dimacs(file));
       break;
     case GraphFormat::Snap:
-      load_snap(file);
+      finalize(load_snap(file));
       break;
     case GraphFormat::Metis:
-      load_metis(file);
+      finalize(load_metis(file));
       break;
     case GraphFormat::EdgeList:
-      load_edge_list(file);
+      finalize(load_edge_list(file));
       break;
   }
-  build_reverse();
-  update_weighted_flag();
 }
 
-void Graph::load_dimacs(const std::string& file) {
+AdjacencyList Graph::load_dimacs(const std::string& file) {
   std::ifstream input(file);
   if (!input) throw std::runtime_error("Could not open file: " + file);
+  AdjacencyList adjacency;
   std::string line;
   std::uint64_t n = 0;
   bool saw_problem = false;
@@ -85,7 +84,7 @@ void Graph::load_dimacs(const std::string& file) {
       if (format != "sp")
         throw std::runtime_error(
             "Unsupported DIMACS problem format (expected 'sp'): " + format);
-      adjacency_.assign(static_cast<std::size_t>(n), {});
+      adjacency.assign(static_cast<std::size_t>(n), {});
       saw_problem = true;
     } else if (command == 'a') {
       std::uint64_t from, to, weight;
@@ -93,11 +92,12 @@ void Graph::load_dimacs(const std::string& file) {
           to == 0 || from > n || to > n || weight == 0 || weight >= kInfinity)
         throw std::runtime_error("Malformed DIMACS arc: " + line);
       // DIMACS is 1-based; every internal API is 0-based.
-      adjacency_[static_cast<VertexId>(from - 1)].emplace_back(
+      adjacency[static_cast<VertexId>(from - 1)].emplace_back(
           static_cast<VertexId>(to - 1), static_cast<Distance>(weight));
     }
   }
   if (!saw_problem) throw std::runtime_error("DIMACS file has no problem line");
+  return adjacency;
 }
 
 // SNAP edge lists (https://snap.stanford.edu/data/) list one directed edge
@@ -105,7 +105,7 @@ void Graph::load_dimacs(const std::string& file) {
 // comment/header lines. Vertex IDs are arbitrary 64-bit integers that need
 // not be contiguous or start at 0, so IDs are compacted on the fly in the
 // order they're first seen.
-void Graph::load_snap(const std::string& file) {
+AdjacencyList Graph::load_snap(const std::string& file) {
   std::ifstream input(file);
   if (!input) throw std::runtime_error("Could not open file: " + file);
   std::unordered_map<std::uint64_t, VertexId> id_map;
@@ -134,10 +134,11 @@ void Graph::load_snap(const std::string& file) {
     intern(from);
     intern(to);
   }
-  adjacency_.assign(id_map.size(), {});
+  AdjacencyList adjacency(id_map.size());
   for (const auto& [from, to, weight] : raw_edges)
-    adjacency_[id_map.at(from)].emplace_back(id_map.at(to),
-                                             static_cast<Distance>(weight));
+    adjacency[id_map.at(from)].emplace_back(id_map.at(to),
+                                            static_cast<Distance>(weight));
+  return adjacency;
 }
 
 // METIS graph format (https://github.com/KarypisLab/METIS manual, Section
@@ -148,9 +149,10 @@ void Graph::load_snap(const std::string& file) {
 // stores undirected graphs by listing each edge in both endpoints' lines,
 // parsing every vertex line as a set of outgoing arcs naturally reproduces
 // both directions.
-void Graph::load_metis(const std::string& file) {
+AdjacencyList Graph::load_metis(const std::string& file) {
   std::ifstream input(file);
   if (!input) throw std::runtime_error("Could not open file: " + file);
+  AdjacencyList adjacency;
   std::string line;
   std::uint64_t n = 0, m = 0;
   int fmt = 0;
@@ -174,7 +176,7 @@ void Graph::load_metis(const std::string& file) {
             "Unsupported METIS fmt (only unweighted '0' or edge-weighted "
             "'1' are supported): " +
             fields[2]);
-      adjacency_.assign(static_cast<std::size_t>(n), {});
+      adjacency.assign(static_cast<std::size_t>(n), {});
       saw_header = true;
       continue;
     }
@@ -192,7 +194,7 @@ void Graph::load_metis(const std::string& file) {
           weighted ? parse_uint(fields[i + 1], "METIS adjacency line") : 1;
       if (to == 0 || to > n || weight == 0 || weight >= kInfinity)
         throw std::runtime_error("Malformed METIS neighbor: " + line);
-      adjacency_[static_cast<VertexId>(vertex)].emplace_back(
+      adjacency[static_cast<VertexId>(vertex)].emplace_back(
           static_cast<VertexId>(to - 1), static_cast<Distance>(weight));
     }
     ++vertex;
@@ -202,12 +204,13 @@ void Graph::load_metis(const std::string& file) {
     throw std::runtime_error(
         "METIS file has fewer adjacency lines than its header declares");
   (void)m;  // m (declared arc count) isn't cross-checked against the body.
+  return adjacency;
 }
 
 // Simple "from,to[,weight]" CSV edge list (weight optional, defaults to 1).
 // An optional non-numeric header row ("from,to,weight") is skipped. As with
 // SNAP, vertex IDs are arbitrary integers and get compacted on the fly.
-void Graph::load_edge_list(const std::string& file) {
+AdjacencyList Graph::load_edge_list(const std::string& file) {
   std::ifstream input(file);
   if (!input) throw std::runtime_error("Could not open file: " + file);
   std::unordered_map<std::uint64_t, VertexId> id_map;
@@ -256,56 +259,43 @@ void Graph::load_edge_list(const std::string& file) {
     intern(from);
     intern(to);
   }
-  adjacency_.assign(id_map.size(), {});
+  AdjacencyList adjacency(id_map.size());
   for (const auto& [from, to, weight] : raw_edges)
-    adjacency_[id_map.at(from)].emplace_back(id_map.at(to),
-                                             static_cast<Distance>(weight));
+    adjacency[id_map.at(from)].emplace_back(id_map.at(to),
+                                            static_cast<Distance>(weight));
+  return adjacency;
 }
 
-Graph::Graph(AdjacencyList adjacency, AdjacencyList reverse)
-    : adjacency_(std::move(adjacency)), reverse_(std::move(reverse)) {
-  if (adjacency_.size() != reverse_.size())
+Graph::Graph(AdjacencyList adjacency, AdjacencyList reverse) {
+  if (adjacency.size() != reverse.size())
     throw std::invalid_argument("Forward and reverse graph sizes differ");
-  // This constructor takes the reverse list as-is instead of deriving it
-  // (that's what the DIMACS-file constructor's build_reverse() is for), so
-  // nothing else checks that `reverse` actually *is* adjacency's reverse.
   // A true reverse always has exactly as many arcs as the forward graph
   // (each forward arc corresponds to exactly one reverse arc), so this is
   // a cheap, if partial, sanity check against a caller-assembled mismatch;
   // it won't catch a reverse with the right arc count but wrong endpoints.
   std::size_t forward_edges = 0, reverse_edges = 0;
-  for (const auto& edges : adjacency_) forward_edges += edges.size();
-  for (const auto& edges : reverse_) reverse_edges += edges.size();
+  for (const auto& edges : adjacency) forward_edges += edges.size();
+  for (const auto& edges : reverse) reverse_edges += edges.size();
   if (forward_edges != reverse_edges)
     throw std::invalid_argument("Forward and reverse graph arc counts differ");
+  adjacency_ = CsrAdjacency(std::move(adjacency));
+  reverse_ = CsrAdjacency(std::move(reverse));
   update_weighted_flag();
 }
 
-std::size_t Graph::num_edges() const {
-  std::size_t result = 0;
-  for (const auto& edges : adjacency_) result += edges.size();
-  return result;
-}
-
-void Graph::build_reverse() {
-  reverse_.assign(adjacency_.size(), {});
-  std::vector<std::size_t> in_degree(adjacency_.size(), 0);
-  for (const auto& edges : adjacency_)
-    for (const auto& [v, w] : edges) ++in_degree[v];
-  for (VertexId v = 0; v < adjacency_.size(); ++v)
-    reverse_[v].reserve(in_degree[v]);
-  for (VertexId u = 0; u < adjacency_.size(); ++u)
-    for (const auto& [v, w] : adjacency_[u]) reverse_[v].emplace_back(u, w);
+void Graph::finalize(AdjacencyList adjacency) {
+  adjacency_ = CsrAdjacency(std::move(adjacency));
+  reverse_ = adjacency_.reversed();
+  update_weighted_flag();
 }
 
 void Graph::update_weighted_flag() {
   weighted_ = false;
-  for (const auto& edges : adjacency_)
-    for (const auto& [unused, weight] : edges)
-      if (weight != 1) {
-        weighted_ = true;
-        return;
-      }
+  for (const Edge& edge : adjacency_.edges())
+    if (edge.second != 1) {
+      weighted_ = true;
+      return;
+    }
 }
 
 std::vector<VertexId> Graph::reorder_by_rank(
@@ -322,13 +312,14 @@ std::vector<VertexId> Graph::reorder_by_rank(
   }
   AdjacencyList reordered(n);
   for (VertexId old_u = 0; old_u < n; ++old_u) {
+    const auto edges = adjacency_[old_u];
     auto& target = reordered[old_to_new[old_u]];
-    target.reserve(adjacency_[old_u].size());
-    for (const auto& [old_v, weight] : adjacency_[old_u])
+    target.reserve(edges.size());
+    for (const auto& [old_v, weight] : edges)
       target.emplace_back(old_to_new[old_v], weight);
   }
-  adjacency_ = std::move(reordered);
-  build_reverse();
+  adjacency_ = CsrAdjacency(std::move(reordered));
+  reverse_ = adjacency_.reversed();
   return old_to_new;
 }
 }  // namespace rxl
