@@ -2,10 +2,14 @@
 #define RXL_PARALLEL_FOR_H
 #include <algorithm>
 #include <cstddef>
-#include <thread>
-#include <vector>
+
+#include "thread_pool.h"
+
 namespace rxl {
 
+// Splits [0, n) into `requested_threads` contiguous chunks and runs body(lo,
+// hi) for each on the shared process-wide ThreadPool, instead of spawning
+// new OS threads per call.
 template <typename Body>
 void parallel_for(std::size_t n, std::size_t requested_threads, Body body) {
   const std::size_t threads =
@@ -15,14 +19,11 @@ void parallel_for(std::size_t n, std::size_t requested_threads, Body body) {
     return;
   }
   const std::size_t chunk = (n + threads - 1) / threads;
-  std::vector<std::thread> workers;
-  workers.reserve(threads - 1);
-  for (std::size_t t = 1; t < threads; ++t) {
+  ThreadPool::instance().run(threads, [&](std::size_t t) {
     const std::size_t lo = t * chunk, hi = std::min(n, lo + chunk);
-    if (lo < hi) workers.emplace_back([body, lo, hi] { body(lo, hi); });
-  }
-  body(std::size_t{0}, std::min(n, chunk));
-  for (auto& w : workers) w.join();
+    if (lo < hi)
+      body(lo, hi);
+  });
 }
-}  // namespace rxl
+} // namespace rxl
 #endif

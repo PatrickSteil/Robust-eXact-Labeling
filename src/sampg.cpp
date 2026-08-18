@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -23,14 +22,14 @@ namespace {
 constexpr std::size_t kMaxCounterBuckets = 32;
 
 struct SampleTree {
-  SampleTree(std::size_t n, DenseBufferPool& pool) : storage(n, pool) {}
+  SampleTree(std::size_t n, DenseBufferPool &pool) : storage(n, pool) {}
   std::size_t bucket = 0;
   SampleTreeStorage storage;
   std::vector<VertexId> members;
   std::size_t remaining = 0;
   std::size_t list_index = 0;
 
-  void reset(std::size_t n, std::size_t new_bucket, DenseBufferPool& pool) {
+  void reset(std::size_t n, std::size_t new_bucket, DenseBufferPool &pool) {
     storage.reset(n, pool);
     members.clear();
     remaining = 0;
@@ -46,28 +45,28 @@ struct TreeScratch {
   dijkstra_detail::IndexedMinHeap heap;
 };
 
-void build_sample_tree(const Graph& graph, VertexId root,
-                       const HubLabels& labels, std::size_t bucket,
-                       std::uint64_t& work, TreeScratch& scratch,
-                       SampleTree& tree, DenseBufferPool& dense_pool) {
+void build_sample_tree(const Graph &graph, VertexId root,
+                       const HubLabels &labels, std::size_t bucket,
+                       std::uint64_t &work, TreeScratch &scratch,
+                       SampleTree &tree, DenseBufferPool &dense_pool) {
   const std::size_t n = graph.num_vertices();
   if (scratch.root_lookup.size() != n) {
     scratch.root_lookup.assign(n, kInfinity);
     scratch.distance.assign(n, kInfinity);
     scratch.heap.assign(n);
   }
-  auto& root_lookup = scratch.root_lookup;
-  auto& distance = scratch.distance;
-  auto& lookup_touched = scratch.lookup_touched;
-  auto& distance_touched = scratch.distance_touched;
-  auto& heap = scratch.heap;
+  auto &root_lookup = scratch.root_lookup;
+  auto &distance = scratch.distance;
+  auto &lookup_touched = scratch.lookup_touched;
+  auto &distance_touched = scratch.distance_touched;
+  auto &heap = scratch.heap;
 
   tree.reset(n, bucket, dense_pool);
-  for (const auto& [hub, d] : labels[root].forward) {
+  for (const auto &[hub, d] : labels[root].forward) {
     root_lookup[hub] = d;
     lookup_touched.push_back(hub);
   }
-  auto& settled = tree.members;
+  auto &settled = tree.members;
   AbstractDijkstra::search(
       root, [&graph](VertexId u) { return graph.adjacency()[u]; }, distance,
       distance_touched, heap,
@@ -108,15 +107,17 @@ void build_sample_tree(const Graph& graph, VertexId root,
   tree.remaining = settled.size();
   tree.storage.maybe_downgrade(tree.members, tree.remaining);
 
-  for (VertexId v : distance_touched) distance[v] = kInfinity;
+  for (VertexId v : distance_touched)
+    distance[v] = kInfinity;
   distance_touched.clear();
-  for (VertexId hub : lookup_touched) root_lookup[hub] = kInfinity;
+  for (VertexId hub : lookup_touched)
+    root_lookup[hub] = kInfinity;
   lookup_touched.clear();
 }
 
 template <class TouchFn>
-void add_tree_scores(const SampleTree& tree, std::size_t buckets,
-                     std::vector<Score>& counters, TouchFn&& touch) {
+void add_tree_scores(const SampleTree &tree, std::size_t buckets,
+                     std::vector<Score> &counters, TouchFn &&touch) {
   for (VertexId v : tree.members) {
     if (tree.storage.alive(v)) {
       counters[static_cast<std::size_t>(v) * buckets + tree.bucket] +=
@@ -126,20 +127,22 @@ void add_tree_scores(const SampleTree& tree, std::size_t buckets,
   }
 }
 
-void register_membership(SampleTree* tree,
-                         std::vector<std::vector<SampleTree*>>& membership) {
+void register_membership(SampleTree *tree,
+                         std::vector<std::vector<SampleTree *>> &membership) {
   for (VertexId v : tree->members)
-    if (tree->storage.alive(v)) membership[v].push_back(tree);
+    if (tree->storage.alive(v))
+      membership[v].push_back(tree);
 }
 
 template <class TouchFn>
-std::size_t remove_subtree(SampleTree& tree, VertexId hub, std::size_t buckets,
-                           std::vector<Score>& counters, bool& downgraded,
-                           TouchFn&& touch,
-                           std::vector<std::vector<SampleTree*>>& membership) {
+std::size_t remove_subtree(SampleTree &tree, VertexId hub, std::size_t buckets,
+                           std::vector<Score> &counters, bool &downgraded,
+                           TouchFn &&touch,
+                           std::vector<std::vector<SampleTree *>> &membership) {
   downgraded = false;
-  auto& storage = tree.storage;
-  if (!storage.alive(hub)) return 0;
+  auto &storage = tree.storage;
+  if (!storage.alive(hub))
+    return 0;
   const Score removed = storage.subtree_of(hub);
   VertexId ancestor = storage.parent_of(hub);
   while (ancestor != kInvalidVertex && storage.alive(ancestor)) {
@@ -153,13 +156,14 @@ std::size_t remove_subtree(SampleTree& tree, VertexId hub, std::size_t buckets,
   while (!stack.empty()) {
     const VertexId v = stack.back();
     stack.pop_back();
-    if (!storage.alive(v)) continue;
+    if (!storage.alive(v))
+      continue;
     counters[static_cast<std::size_t>(v) * buckets + tree.bucket] -=
         storage.subtree_of(v);
     touch(v);
     const std::vector<VertexId> children = storage.children_of(v);
     storage.deactivate(v);
-    auto& lst = membership[v];
+    auto &lst = membership[v];
     for (std::size_t i = 0; i < lst.size(); ++i) {
       if (lst[i] == &tree) {
         lst[i] = lst.back();
@@ -167,7 +171,8 @@ std::size_t remove_subtree(SampleTree& tree, VertexId hub, std::size_t buckets,
         break;
       }
     }
-    for (VertexId child : children) stack.push_back(child);
+    for (VertexId child : children)
+      stack.push_back(child);
   }
   tree.remaining -= static_cast<std::size_t>(removed);
   downgraded = storage.maybe_downgrade(tree.members, tree.remaining);
@@ -175,14 +180,16 @@ std::size_t remove_subtree(SampleTree& tree, VertexId hub, std::size_t buckets,
 }
 
 template <class TouchFn>
-void retire_remaining(SampleTree& tree, std::size_t buckets,
-                      std::vector<Score>& counters, std::size_t& live_vertices,
-                      TouchFn&& touch,
-                      std::vector<std::vector<SampleTree*>>& membership) {
+void retire_remaining(SampleTree &tree, std::size_t buckets,
+                      std::vector<Score> &counters, std::size_t &live_vertices,
+                      TouchFn &&touch,
+                      std::vector<std::vector<SampleTree *>> &membership) {
   for (VertexId v : tree.members) {
-    if (!tree.storage.alive(v)) continue;
+    if (!tree.storage.alive(v))
+      continue;
     const VertexId parent = tree.storage.parent_of(v);
-    if (parent != kInvalidVertex && tree.storage.alive(parent)) continue;
+    if (parent != kInvalidVertex && tree.storage.alive(parent))
+      continue;
     bool downgraded = false;
     live_vertices -= remove_subtree(tree, v, buckets, counters, downgraded,
                                     touch, membership);
@@ -190,8 +197,8 @@ void retire_remaining(SampleTree& tree, std::size_t buckets,
 }
 
 void retire_tree(std::size_t idx,
-                 std::vector<std::unique_ptr<SampleTree>>& trees,
-                 std::vector<std::unique_ptr<SampleTree>>& tree_pool) {
+                 std::vector<std::unique_ptr<SampleTree>> &trees,
+                 std::vector<std::unique_ptr<SampleTree>> &tree_pool) {
   tree_pool.push_back(std::move(trees[idx]));
   const std::size_t last = trees.size() - 1;
   if (idx != last) {
@@ -201,7 +208,7 @@ void retire_tree(std::size_t idx,
   trees.pop_back();
 }
 
-std::pair<Score, Score> priority(const Score* counter, std::size_t buckets,
+std::pair<Score, Score> priority(const Score *counter, std::size_t buckets,
                                  std::size_t discard) {
   std::array<Score, kMaxCounterBuckets> scratch;
   std::copy(counter, counter + buckets, scratch.begin());
@@ -217,12 +224,12 @@ std::pair<Score, Score> priority(const Score* counter, std::size_t buckets,
   return {robust, total};
 }
 
-}  // namespace
+} // namespace
 
-std::vector<VertexId> SamPG::build_order(const Graph& graph,
-                                         const SamplingOptions& options,
-                                         HubLabels& labels,
-                                         BuildStatistics& stats) {
+std::vector<VertexId> SamPG::build_order(const Graph &graph,
+                                         const SamplingOptions &options,
+                                         HubLabels &labels,
+                                         BuildStatistics &stats) {
   if (options.discarded_max_buckets >= options.counter_buckets)
     throw std::invalid_argument(
         "SamPG must retain at least one counter bucket");
@@ -252,7 +259,7 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
   };
   std::vector<Score> counters(n * buckets, Score(0));
 
-  std::vector<std::vector<SampleTree*>> membership(n);
+  std::vector<std::vector<SampleTree *>> membership(n);
 
   std::vector<std::size_t> degree(n);
   parallel_for(n, options.num_threads,
@@ -268,7 +275,8 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
   AddressableHeap heap(n);
 
   auto touch = [&](VertexId v) {
-    if (selected[v]) return;
+    if (selected[v])
+      return;
     const auto p = priority(&counters[static_cast<std::size_t>(v) * buckets],
                             buckets, options.discarded_max_buckets);
     heap.set(v, p.first, p.second, degree[v]);
@@ -278,7 +286,7 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
   const std::size_t threads = std::max<std::size_t>(1, options.num_threads);
   std::size_t live_vertices = 0;
   std::vector<TreeScratch> scratch_pool(threads);
-  auto grow_batch = [&](const std::vector<VertexId>& batch_roots,
+  auto grow_batch = [&](const std::vector<VertexId> &batch_roots,
                         std::size_t first_bucket) {
     using Built = std::pair<std::unique_ptr<SampleTree>, std::uint64_t>;
     std::vector<Built> built;
@@ -297,34 +305,30 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
       lane_trees.reserve(batch_roots.size());
       for (std::size_t i = 0; i < batch_roots.size(); ++i)
         lane_trees.push_back(acquire_tree());
-      std::vector<std::future<std::uint64_t>> futures;
-      futures.reserve(batch_roots.size());
-      for (std::size_t i = 0; i < batch_roots.size(); ++i) {
+      std::vector<std::uint64_t> lane_work(batch_roots.size(), 0);
+      // Dispatched on the shared, persistent ThreadPool rather than
+      // std::async: this loop runs many times over the course of ordering
+      // (once per replenishment inside the per-rank loop), so reusing
+      // already-parked worker threads instead of creating new OS threads
+      // per batch removes what would otherwise be recurring thread-creation
+      // overhead on the hot path.
+      ThreadPool::instance().run(batch_roots.size(), [&](std::size_t i) {
         const VertexId root = batch_roots[i];
         const std::size_t bucket = (first_bucket + i) % buckets;
-        TreeScratch& lane = scratch_pool[i];
-        SampleTree& tree_ref = *lane_trees[i];
-        futures.emplace_back(std::async(
-            std::launch::async,
-            [&graph, &labels, &lane, &tree_ref, root, bucket, &dense_pool] {
-              std::uint64_t work = 0;
-              build_sample_tree(graph, root, labels, bucket, work, lane,
-                                tree_ref, dense_pool);
-              return work;
-            }));
-      }
-      for (std::size_t i = 0; i < futures.size(); ++i) {
-        const std::uint64_t work = futures[i].get();
-        built.emplace_back(std::move(lane_trees[i]), work);
-      }
+        build_sample_tree(graph, root, labels, bucket, lane_work[i],
+                          scratch_pool[i], *lane_trees[i], dense_pool);
+      });
+      for (std::size_t i = 0; i < batch_roots.size(); ++i)
+        built.emplace_back(std::move(lane_trees[i]), lane_work[i]);
     }
-    for (auto& item : built) {
+    for (auto &item : built) {
       tree_work += item.second;
       stats.sampling_work += item.second;
       add_tree_scores(*item.first, buckets, counters, touch);
       register_membership(item.first.get(), membership);
       live_vertices += item.first->remaining;
-      if (!item.first->storage.is_dense()) ++stats.sparse_downgrades;
+      if (!item.first->storage.is_dense())
+        ++stats.sparse_downgrades;
       trees.push_back(std::move(item.first));
       trees.back()->list_index = trees.size() - 1;
       ++stats.sampled_trees;
@@ -339,7 +343,8 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
   tree_work = 0;
 
   for (VertexId v = 0; v < n; ++v)
-    if (!heap.contains(v)) touch(v);
+    if (!heap.contains(v))
+      touch(v);
 
   std::vector<VertexId> order;
   order.reserve(n);
@@ -372,12 +377,13 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
                 << ": selected vertex " << best << ", live trees "
                 << trees.size() << "\n";
 
-    const std::vector<SampleTree*> containing_best = membership[best];
-    for (SampleTree* tree_ptr : containing_best) {
+    const std::vector<SampleTree *> containing_best = membership[best];
+    for (SampleTree *tree_ptr : containing_best) {
       bool downgraded = false;
       live_vertices -= remove_subtree(*tree_ptr, best, buckets, counters,
                                       downgraded, touch, membership);
-      if (downgraded) ++stats.sparse_downgrades;
+      if (downgraded)
+        ++stats.sparse_downgrades;
       if (tree_ptr->remaining > 0 &&
           tree_ptr->remaining <= options.min_tree_vertices)
         retire_remaining(*tree_ptr, buckets, counters, live_vertices, touch,
@@ -399,9 +405,11 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
         }
         const VertexId root = roots[next_root++];
         ++attempts;
-        if (!selected[root]) batch.push_back(root);
+        if (!selected[root])
+          batch.push_back(root);
       }
-      if (batch.empty()) break;
+      if (batch.empty())
+        break;
       grow_batch(batch, trees.size() % buckets);
     }
     stats.peak_live_trees = std::max(stats.peak_live_trees, trees.size());
@@ -410,4 +418,4 @@ std::vector<VertexId> SamPG::build_order(const Graph& graph,
   return order;
 }
 
-}  // namespace rxl
+} // namespace rxl
