@@ -90,6 +90,11 @@ int main(int argc, char** argv) {
         "m", "min-tree-vertices", 8,
         "Force-retire a sample tree once it has shrunk to at most this "
         "many remaining vertices (0 disables early retirement)");
+    parser.set_optional<bool>(
+        "z", "zero-one-bfs", false,
+        "Build with a deque-based 0-1 BFS instead of Dijkstra's "
+        "binary-heap search. Faster, but only correct if every edge "
+        "weight in the graph is 0 or 1; errors out otherwise");
 
     if (!parser.run()) return 1;
 
@@ -109,6 +114,7 @@ int main(int argc, char** argv) {
     const bool reorder = !parser.get<bool>("r");
     const std::size_t min_tree_vertices =
         static_cast<std::size_t>(parser.get<unsigned long long>("m"));
+    const bool zero_one_bfs = parser.get<bool>("z");
 
     if (!benchmark_queries)
       throw std::invalid_argument("--benchmark-queries must be positive");
@@ -148,9 +154,10 @@ int main(int argc, char** argv) {
       options.num_threads = threads;
       options.verbose = verbose;
       options.min_tree_vertices = min_tree_vertices;
-      result = degree
-                   ? PrunedLabeling::compute_with_degree_order(graph, verbose)
-                   : PrunedLabeling::compute(graph, options);
+      options.zero_one_bfs = zero_one_bfs;
+      result = degree ? PrunedLabeling::compute_with_degree_order(
+                            graph, verbose, zero_one_bfs)
+                      : PrunedLabeling::compute(graph, options);
       if (reorder) {
         graph.reorder_by_rank(result.rank_to_vertex);
         PrunedLabeling::reorder_labels_by_rank(result);
@@ -165,6 +172,7 @@ int main(int argc, char** argv) {
                   << s.max_backward_size
                   << ", raw-entry-bytes=" << s.payload_bytes << '\n';
         std::cout << "Build: ordering=" << (degree ? "degree" : "SamPG")
+                  << ", frontier=" << (zero_one_bfs ? "0-1-bfs" : "dijkstra")
                   << ", threads=" << threads << ", seconds="
                   << result.statistics.ordering_and_labeling_seconds
                   << ", sampled-trees=" << result.statistics.sampled_trees

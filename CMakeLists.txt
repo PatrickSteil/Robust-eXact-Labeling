@@ -67,6 +67,7 @@ if(BUILD_TESTING)
     tests/test_parallel_determinism.cpp
     tests/test_sparse_tree_storage.cpp
     tests/test_statistics.cpp
+    tests/test_zero_one_bfs.cpp
   )
   target_link_libraries(tests PRIVATE rxl)
   target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})

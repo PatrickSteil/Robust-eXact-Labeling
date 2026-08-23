@@ -20,6 +20,7 @@ struct SamplingOptions {
   bool verbose = false;
   std::size_t max_live_trees = std::numeric_limits<std::size_t>::max();
   std::size_t min_tree_vertices = 8;
+  bool zero_one_bfs = false;
 };
 
 class SamPG {
