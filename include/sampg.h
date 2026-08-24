@@ -20,6 +20,42 @@ struct SamplingOptions {
   bool verbose = false;
   std::size_t max_live_trees = std::numeric_limits<std::size_t>::max();
   std::size_t min_tree_vertices = 8;
+  bool zero_one_bfs = false;
+
+  // --- Batched labeling (BVC-PLL-style), off by default. ---
+  // Number of hubs picked "at once" (without letting sample-tree scores
+  // react in between) at the start of the run, and processed through the
+  // batched, multi-lane labeling kernel instead of one at a time. 1 keeps
+  // the original fully-sequential behavior.
+  std::size_t initial_batch_size = 1;
+  // Upper bound the adaptive-phase batch size grows to (see
+  // batch_growth_factor). Ignored while <= initial_batch_size.
+  std::size_t max_batch_size = 1;
+  // Each adaptive-phase batch's size is multiplied by this factor
+  // (rounded up), then clamped to max_batch_size. 1.0 keeps the batch
+  // size fixed at initial_batch_size. Values > 1 give small, faithful
+  // batches early (when picking the truly-best vertex matters most) and
+  // large, cheap batches later (once marginal hub value has flattened).
+  double batch_growth_factor = 1.0;
+  // When popping a batch from the selection heap, skip a candidate that
+  // shares a live sample tree with a vertex already accepted into this
+  // batch, and requeue it for the next batch instead. Intended to reduce
+  // near-duplicate hubs within a batch, but measured to *increase* label
+  // size in practice (and increasingly so at larger batch sizes): forcing
+  // a reject just backfills the batch with a lower-priority candidate,
+  // which costs more than the duplication it avoids. Defaults to off;
+  // kept as an option for further tuning, not a validated improvement.
+  bool batch_diversity_filter = false;
+  // Fraction of vertices (by rank) ordered via full adaptive SamPG
+  // sampling. The remaining tail is ordered once, cheaply, by freezing
+  // whatever SamPG priority scores exist at that point (no further
+  // sampling), and labeled through the same batched kernel using
+  // tail_batch_size. 1.0 (default) samples the entire order, matching
+  // the un-batched algorithm's coverage.
+  double sampling_fraction = 1.0;
+  // Batch size used once sampling_fraction has been reached. Defaults to
+  // max_batch_size when left at 0.
+  std::size_t tail_batch_size = 0;
 };
 
 class SamPG {

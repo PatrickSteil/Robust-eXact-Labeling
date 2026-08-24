@@ -10,6 +10,7 @@
 #include "parallel_for.h"
 #include "pruned_dijkstra.h"
 #include "sampg.h"
+#include "search_frontier.h"
 
 namespace rxl {
 namespace {
@@ -35,15 +36,17 @@ std::vector<VertexId> PrunedLabeling::degree_order(const Graph& graph) {
   return order;
 }
 
-LabelingResult PrunedLabeling::compute_with_degree_order(const Graph& graph,
-                                                         const bool verbose) {
+namespace {
+template <typename Frontier>
+LabelingResult compute_with_degree_order_impl(const Graph& graph,
+                                              const bool verbose) {
   const std::size_t n = graph.num_vertices();
   HubLabels labels(n);
-  auto order = degree_order(graph);
+  auto order = PrunedLabeling::degree_order(graph);
   std::vector<Distance> root_out(n, kInfinity), root_in(n, kInfinity),
       distance(n, kInfinity);
   std::vector<VertexId> lookup, touched;
-  dijkstra_detail::IndexedMinHeap heap(n);
+  Frontier frontier(n);
   for (std::size_t rank = 0; rank < order.size(); ++rank) {
     if (verbose && (rank < 10 || (rank + 1) % 1000 == 0 || rank + 1 == n)) {
       std::cerr << "[rxl] rank " << (rank + 1) << '/' << n
@@ -51,15 +54,30 @@ LabelingResult PrunedLabeling::compute_with_degree_order(const Graph& graph,
     }
 
     HubExpansion::add_hub(graph, order[rank], static_cast<VertexId>(rank),
-                          labels, root_out, root_in, distance, lookup,
-                          touched, heap);
+                          labels, root_out, root_in, distance, lookup, touched,
+                          frontier);
   }
   return finish(std::move(labels), std::move(order));
+}
+}  // namespace
+
+LabelingResult PrunedLabeling::compute_with_degree_order(
+    const Graph& graph, const bool verbose, const bool zero_one_bfs) {
+  if (zero_one_bfs && !graph.is_zero_one_weighted())
+    throw std::invalid_argument(
+        "PrunedLabeling::compute_with_degree_order: zero_one_bfs requires "
+        "every edge weight to be 0 or 1");
+  return zero_one_bfs
+             ? compute_with_degree_order_impl<ZeroOneBfsFrontier>(graph,
+                                                                  verbose)
+             : compute_with_degree_order_impl<DijkstraFrontier>(graph, verbose);
 }
 
 LabelingResult PrunedLabeling::compute(const Graph& graph,
                                        const SamplingOptions& options) {
-  if (options.initial_trees == 0) return compute_with_degree_order(graph);
+  if (options.initial_trees == 0)
+    return compute_with_degree_order(graph, options.verbose,
+                                     options.zero_one_bfs);
   HubLabels labels(graph.num_vertices());
   BuildStatistics statistics;
   const auto start = std::chrono::steady_clock::now();

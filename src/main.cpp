@@ -90,6 +90,43 @@ int main(int argc, char** argv) {
         "m", "min-tree-vertices", 8,
         "Force-retire a sample tree once it has shrunk to at most this "
         "many remaining vertices (0 disables early retirement)");
+    parser.set_optional<bool>(
+        "z", "zero-one-bfs", false,
+        "Build with a deque-based 0-1 BFS instead of Dijkstra's "
+        "binary-heap search. Faster, but only correct if every edge "
+        "weight in the graph is 0 or 1; errors out otherwise");
+    parser.set_optional<unsigned long long>(
+        "batch-initial-size", "batch-initial-size", 1,
+        "Number of hubs picked at once (without letting sample-tree "
+        "scores react in between) at the start of the run. 1 keeps the "
+        "original fully-sequential SamPG algorithm");
+    parser.set_optional<unsigned long long>(
+        "batch-max-size", "batch-max-size", 1,
+        "Upper bound the adaptive-phase batch size may grow to (see "
+        "--batch-growth). Ignored while <= --batch-initial-size");
+    parser.set_optional<double>(
+        "batch-growth", "batch-growth", 1.0,
+        "Growth factor applied to the batch size after every batch "
+        "during the adaptive phase, rounded up and clamped to "
+        "--batch-max-size. 1.0 keeps the batch size fixed");
+    parser.set_optional<bool>(
+        "batch-diversity", "batch-diversity", false,
+        "Enable the tree-membership diversity filter that requeues a "
+        "batch candidate sharing a live sample tree with one already "
+        "accepted this round. Off by default: measured to increase "
+        "label size rather than reduce it (a rejected candidate just "
+        "gets replaced by a lower-priority one), worse at larger batch "
+        "sizes. Provided for further experimentation");
+    parser.set_optional<double>(
+        "sampling-fraction", "sampling-fraction", 1.0,
+        "Fraction of vertices (by rank) ordered via full adaptive SamPG "
+        "sampling; the remaining tail is ordered once by freezing "
+        "current SamPG priority scores and labeled via the same batched "
+        "kernel. 1.0 samples the entire order");
+    parser.set_optional<unsigned long long>(
+        "tail-batch-size", "tail-batch-size", 0,
+        "Batch size used once --sampling-fraction has been reached. "
+        "0 (default) reuses --batch-max-size");
 
     if (!parser.run()) return 1;
 
@@ -109,10 +146,29 @@ int main(int argc, char** argv) {
     const bool reorder = !parser.get<bool>("r");
     const std::size_t min_tree_vertices =
         static_cast<std::size_t>(parser.get<unsigned long long>("m"));
+    const bool zero_one_bfs = parser.get<bool>("z");
+    const std::size_t batch_initial_size = static_cast<std::size_t>(
+        parser.get<unsigned long long>("batch-initial-size"));
+    const std::size_t batch_max_size = static_cast<std::size_t>(
+        parser.get<unsigned long long>("batch-max-size"));
+    const double batch_growth = parser.get<double>("batch-growth");
+    const bool batch_diversity_filter = parser.get<bool>("batch-diversity");
+    const double sampling_fraction = parser.get<double>("sampling-fraction");
+    const std::size_t tail_batch_size = static_cast<std::size_t>(
+        parser.get<unsigned long long>("tail-batch-size"));
 
     if (!benchmark_queries)
       throw std::invalid_argument("--benchmark-queries must be positive");
     if (!threads) throw std::invalid_argument("--threads must be positive");
+    if (!batch_initial_size)
+      throw std::invalid_argument("--batch-initial-size must be positive");
+    if (!batch_max_size)
+      throw std::invalid_argument("--batch-max-size must be positive");
+    if (batch_growth < 1.0)
+      throw std::invalid_argument("--batch-growth must be >= 1.0");
+    if (sampling_fraction < 0.0 || sampling_fraction > 1.0)
+      throw std::invalid_argument(
+          "--sampling-fraction must be between 0.0 and 1.0");
 
     const GraphFormat format = parse_graph_format(format_name);
 
@@ -148,9 +204,22 @@ int main(int argc, char** argv) {
       options.num_threads = threads;
       options.verbose = verbose;
       options.min_tree_vertices = min_tree_vertices;
-      result = degree
-                   ? PrunedLabeling::compute_with_degree_order(graph, verbose)
-                   : PrunedLabeling::compute(graph, options);
+      options.zero_one_bfs = zero_one_bfs;
+      options.initial_batch_size = batch_initial_size;
+      options.max_batch_size = batch_max_size;
+      options.batch_growth_factor = batch_growth;
+      options.batch_diversity_filter = batch_diversity_filter;
+      options.sampling_fraction = sampling_fraction;
+      options.tail_batch_size = tail_batch_size;
+      if (degree &&
+          (batch_initial_size != 1 || batch_max_size != 1 ||
+           batch_growth != 1.0 || sampling_fraction != 1.0))
+        std::cerr << "Warning: --batch-* and --sampling-fraction only "
+                     "apply to SamPG ordering and are ignored with "
+                     "--degree\n";
+      result = degree ? PrunedLabeling::compute_with_degree_order(
+                            graph, verbose, zero_one_bfs)
+                      : PrunedLabeling::compute(graph, options);
       if (reorder) {
         graph.reorder_by_rank(result.rank_to_vertex);
         PrunedLabeling::reorder_labels_by_rank(result);
@@ -165,7 +234,15 @@ int main(int argc, char** argv) {
                   << s.max_backward_size
                   << ", raw-entry-bytes=" << s.payload_bytes << '\n';
         std::cout << "Build: ordering=" << (degree ? "degree" : "SamPG")
-                  << ", threads=" << threads << ", seconds="
+                  << ", frontier=" << (zero_one_bfs ? "0-1-bfs" : "dijkstra")
+                  << ", threads=" << threads;
+        if (!degree)
+          std::cout << ", batch=[" << batch_initial_size << ".."
+                     << batch_max_size << "]x" << batch_growth
+                     << ", diversity="
+                     << (batch_diversity_filter ? "on" : "off")
+                     << ", sampling-fraction=" << sampling_fraction;
+        std::cout << ", seconds="
                   << result.statistics.ordering_and_labeling_seconds
                   << ", sampled-trees=" << result.statistics.sampled_trees
                   << ", peak-live-trees=" << result.statistics.peak_live_trees
