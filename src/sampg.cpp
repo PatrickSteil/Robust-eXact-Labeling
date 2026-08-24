@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -9,9 +10,11 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <unordered_set>
 
 #include "abstract_dijkstra.h"
 #include "addressable_heap.h"
+#include "batch_pruned_labeling.h"
 #include "indexed_minheap.h"
 #include "parallel_for.h"
 #include "pruned_dijkstra.h"
@@ -341,10 +344,17 @@ std::vector<VertexId> build_order_impl(const Graph& graph,
 
   std::vector<VertexId> order;
   order.reserve(n);
+  // Sequential path (batch size 1, the default) keeps using exactly this
+  // scratch and HubExpansion::add_hub, so its behavior/perf is unchanged
+  // from before batching existed. The batched path below has its own
+  // lazily-sized scratch.
   std::vector<Distance> root_out(n, kInfinity), root_in(n, kInfinity),
       distance(n, kInfinity);
   std::vector<VertexId> lookup_touched, search_touched;
   Frontier dijkstra_frontier(n);
+  std::vector<BatchLaneScratch<Frontier>> lane_scratch;
+  BatchCommitScratch commit_scratch;
+
   std::size_t next_root = initial;
   const std::size_t factor = 10 * std::max<std::size_t>(1, initial);
   const std::size_t max_tree_vertices =
@@ -352,38 +362,19 @@ std::vector<VertexId> build_order_impl(const Graph& graph,
           ? std::numeric_limits<std::size_t>::max()
           : factor * n;
 
-  for (std::size_t rank = 0; rank < n; ++rank) {
-    if (heap.empty())
-      throw std::logic_error(
-          "SamPG: selection heap exhausted before all vertices were "
-          "ranked");
-    const VertexId best = heap.pop_top();
-    selected[best] = 1;
-    order.push_back(best);
-    label_work += HubExpansion::add_hub(
-        graph, best, static_cast<VertexId>(rank), labels, root_out, root_in,
-        distance, lookup_touched, search_touched, dijkstra_frontier);
+  const double sampling_fraction =
+      std::min(1.0, std::max(0.0, options.sampling_fraction));
+  const std::size_t sampled_ranks =
+      static_cast<std::size_t>(sampling_fraction * static_cast<double>(n));
+  const std::size_t max_batch_size =
+      std::max<std::size_t>(1, std::max(options.initial_batch_size,
+                                        options.max_batch_size));
+  std::size_t current_batch_size =
+      std::min(max_batch_size, std::max<std::size_t>(1, options.initial_batch_size));
 
-    if (options.verbose &&
-        (rank < 10 || (rank + 1) % 1000 == 0 || rank + 1 == n))
-      std::cerr << "[rxl] rank " << (rank + 1) << '/' << n
-                << ": selected vertex " << best << ", live trees "
-                << trees.size() << "\n";
-
-    const std::vector<SampleTree*> containing_best = membership[best];
-    for (SampleTree* tree_ptr : containing_best) {
-      bool downgraded = false;
-      live_vertices -= remove_subtree(*tree_ptr, best, buckets, counters,
-                                      downgraded, touch, membership);
-      if (downgraded) ++stats.sparse_downgrades;
-      if (tree_ptr->remaining > 0 &&
-          tree_ptr->remaining <= options.min_tree_vertices)
-        retire_remaining(*tree_ptr, buckets, counters, live_vertices, touch,
-                         membership);
-      if (tree_ptr->remaining == 0)
-        retire_tree(tree_ptr->list_index, trees, tree_pool);
-    }
-
+  // Replenishes sample trees exactly as the un-batched loop used to, just
+  // called once per hub-batch instead of once per hub.
+  auto replenish_trees = [&]() {
     std::size_t attempts = 0;
     while ((trees.size() < buckets || tree_work <= label_work) &&
            trees.size() < options.max_live_trees &&
@@ -403,6 +394,134 @@ std::vector<VertexId> build_order_impl(const Graph& graph,
       grow_batch(batch, trees.size() % buckets);
     }
     stats.peak_live_trees = std::max(stats.peak_live_trees, trees.size());
+  };
+
+  // Pops up to `size` vertices off the selection heap "at once", i.e.
+  // without letting remove_subtree touch/rebalance scores in between --
+  // that rebalancing is exactly what a size-1 batch (the sequential
+  // algorithm) does between every pick, and skipping it is what makes
+  // batching cheaper but approximate. When batch_diversity_filter is on,
+  // a candidate that already shares a live sample tree with something
+  // just accepted into this batch is requeued instead: same-tree
+  // candidates tend to be near-duplicates (one dominates a region the
+  // other also covers), and the batched kernel below cannot prune such
+  // duplicates against each other mid-batch the way sequential PLL would.
+  auto pop_hub_batch = [&](std::size_t size) {
+    std::vector<VertexId> batch;
+    batch.reserve(size);
+    if (!options.batch_diversity_filter) {
+      while (batch.size() < size && !heap.empty())
+        batch.push_back(heap.pop_top());
+      for (VertexId v : batch) selected[v] = 1;
+      return batch;
+    }
+
+    std::unordered_set<SampleTree*> batch_trees;
+    std::vector<VertexId> requeue;
+    const std::size_t max_pops = size * 8 + 8;
+    std::size_t pops = 0;
+    while (batch.size() < size && !heap.empty() && pops < max_pops) {
+      const VertexId cand = heap.pop_top();
+      ++pops;
+      bool conflict = false;
+      for (SampleTree* t : membership[cand]) {
+        if (batch_trees.count(t)) {
+          conflict = true;
+          break;
+        }
+      }
+      if (conflict) {
+        requeue.push_back(cand);
+        continue;
+      }
+      batch.push_back(cand);
+      for (SampleTree* t : membership[cand]) batch_trees.insert(t);
+    }
+    // Exhausted the pop budget (or the heap) while still under-full --
+    // rather than stall, accept some conflicts to make progress.
+    while (batch.size() < size && !requeue.empty()) {
+      batch.push_back(requeue.back());
+      requeue.pop_back();
+    }
+    for (VertexId v : batch) selected[v] = 1;
+    for (VertexId v : requeue) touch(v);
+    return batch;
+  };
+
+  for (std::size_t rank = 0; rank < n;) {
+    if (heap.empty())
+      throw std::logic_error(
+          "SamPG: selection heap exhausted before all vertices were "
+          "ranked");
+
+    const bool tail_phase = rank >= sampled_ranks;
+    std::size_t batch_size =
+        tail_phase ? (options.tail_batch_size > 0 ? options.tail_batch_size
+                                                  : max_batch_size)
+                  : current_batch_size;
+    batch_size = std::min(batch_size, n - rank);
+
+    std::vector<VertexId> hub_batch;
+    if (tail_phase) {
+      // Sampling is done: no more score updates are coming, so just drain
+      // the heap in whatever priority order it was last left in.
+      hub_batch.reserve(batch_size);
+      while (hub_batch.size() < batch_size && !heap.empty())
+        hub_batch.push_back(heap.pop_top());
+      for (VertexId v : hub_batch) selected[v] = 1;
+    } else {
+      hub_batch = pop_hub_batch(batch_size);
+    }
+    if (hub_batch.empty())
+      throw std::logic_error(
+          "SamPG: selection heap exhausted before all vertices were "
+          "ranked");
+
+    for (VertexId v : hub_batch) order.push_back(v);
+    if (hub_batch.size() == 1) {
+      label_work += HubExpansion::add_hub(
+          graph, hub_batch[0], static_cast<VertexId>(rank), labels, root_out,
+          root_in, distance, lookup_touched, search_touched,
+          dijkstra_frontier);
+    } else {
+      label_work += BatchHubExpansion::add_hub_batch(
+          graph, hub_batch, static_cast<VertexId>(rank), labels, threads,
+          lane_scratch, commit_scratch);
+    }
+
+    if (options.verbose &&
+        (rank < 10 || (rank + hub_batch.size()) / 1000 != rank / 1000 ||
+         rank + hub_batch.size() == n))
+      std::cerr << "[rxl] rank " << (rank + hub_batch.size()) << '/' << n
+                << ": selected " << hub_batch.size()
+                << " vertex/vertices this batch, live trees " << trees.size()
+                << "\n";
+
+    if (!tail_phase) {
+      for (VertexId best : hub_batch) {
+        const std::vector<SampleTree*> containing_best = membership[best];
+        for (SampleTree* tree_ptr : containing_best) {
+          bool downgraded = false;
+          live_vertices -= remove_subtree(*tree_ptr, best, buckets, counters,
+                                          downgraded, touch, membership);
+          if (downgraded) ++stats.sparse_downgrades;
+          if (tree_ptr->remaining > 0 &&
+              tree_ptr->remaining <= options.min_tree_vertices)
+            retire_remaining(*tree_ptr, buckets, counters, live_vertices,
+                             touch, membership);
+          if (tree_ptr->remaining == 0)
+            retire_tree(tree_ptr->list_index, trees, tree_pool);
+        }
+      }
+      replenish_trees();
+      current_batch_size = std::max<std::size_t>(
+          1, std::min(max_batch_size,
+                      static_cast<std::size_t>(std::ceil(
+                          static_cast<double>(current_batch_size) *
+                          options.batch_growth_factor))));
+    }
+
+    rank += hub_batch.size();
   }
   stats.labeling_work = label_work;
   return order;

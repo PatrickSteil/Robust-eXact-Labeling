@@ -12,6 +12,9 @@ void test_varint_encoding_byte_boundaries();
 void test_parallel_determinism();
 void test_sparse_tree_storage();
 void test_statistics();
+void test_batch_size_one_matches_sequential();
+void test_batched_labeling_is_exact();
+void test_batched_labeling_thread_count_agrees();
 
 int main() {
   try {
@@ -26,6 +29,9 @@ int main() {
     test_parallel_determinism();
     test_sparse_tree_storage();
     test_statistics();
+    test_batch_size_one_matches_sequential();
+    test_batched_labeling_is_exact();
+    test_batched_labeling_thread_count_agrees();
     std::cout << "All RXL tests passed\n";
   } catch (const std::exception& e) {
     std::cerr << e.what() << '\n';

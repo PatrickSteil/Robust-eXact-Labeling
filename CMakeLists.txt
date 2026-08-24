@@ -24,6 +24,7 @@ add_library(rxl
   src/dijkstra.cpp
   src/addressable_heap.cpp
   src/pruned_dijkstra.cpp
+  src/batch_pruned_labeling.cpp
   src/sampg.cpp
   src/pruned_labeling.cpp
   src/query_support.cpp
@@ -68,6 +69,7 @@ if(BUILD_TESTING)
     tests/test_sparse_tree_storage.cpp
     tests/test_statistics.cpp
     tests/test_zero_one_bfs.cpp
+    tests/test_batch_labeling.cpp
   )
   target_link_libraries(tests PRIVATE rxl)
   target_include_directories(tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
