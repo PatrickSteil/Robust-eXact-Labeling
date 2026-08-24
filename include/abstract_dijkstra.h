@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "indexed_minheap.h"
+#include "search_frontier.h"
 #include "types.h"
 
 namespace rxl {
@@ -18,17 +19,17 @@ namespace rxl {
 class AbstractDijkstra {
  public:
   template <
-      typename NeighborsFn, typename OnPop = dijkstra_detail::NoOpOnPop,
+      typename Frontier, typename NeighborsFn,
+      typename OnPop = dijkstra_detail::NoOpOnPop,
       typename ShouldPrune = dijkstra_detail::NeverPrune,
       typename OnSettle = dijkstra_detail::NoOpOnSettle,
       typename OnRelax = dijkstra_detail::NoOpOnRelax,
       typename OnNonImprovingEdge = dijkstra_detail::NoOpOnNonImprovingEdge>
   static void search(VertexId source, NeighborsFn neighbors,
                      std::vector<Distance>& distance,
-                     std::vector<VertexId>& touched,
-                     dijkstra_detail::IndexedMinHeap& heap, OnPop on_pop = {},
-                     ShouldPrune should_prune = {}, OnSettle on_settle = {},
-                     OnRelax on_relax = {},
+                     std::vector<VertexId>& touched, Frontier& frontier,
+                     OnPop on_pop = {}, ShouldPrune should_prune = {},
+                     OnSettle on_settle = {}, OnRelax on_relax = {},
                      OnNonImprovingEdge on_non_improving_edge = {}) {
     if (source >= distance.size())
       throw std::out_of_range("AbstractDijkstra: source vertex out of range");
@@ -36,20 +37,17 @@ class AbstractDijkstra {
     assert(distance[source] == kInfinity &&
            "AbstractDijkstra: distance[source] must be kInfinity on entry "
            "(buffer not freshly reset)");
-    assert(heap.capacity() == distance.size() &&
-           "AbstractDijkstra: heap must be sized to match distance/graph "
-           "(caller should assign() it once and reuse it, not resize it "
-           "per call)");
-    assert(heap.empty() &&
-           "AbstractDijkstra: heap must be empty on entry -- reuse the same "
-           "instance across calls rather than passing a fresh or "
+    assert(frontier.empty() &&
+           "AbstractDijkstra: frontier must be empty on entry -- reuse the "
+           "same instance across calls rather than passing a fresh or "
            "in-progress one");
     distance[source] = 0;
     touched.push_back(source);
-    heap.decrease_key(source, 0);
+    frontier.relax(source, 0, 0);
 
-    while (!heap.empty()) {
-      const auto [du, u] = heap.pop_min();
+    while (!frontier.empty()) {
+      const auto [du, u] = frontier.pop();
+      if (du != distance[u]) continue;  // stale entry, see comment above
       on_pop(u, du);
       if (should_prune(u, du)) continue;
       on_settle(u, du);
@@ -74,7 +72,7 @@ class AbstractDijkstra {
         if (candidate < distance[v] && candidate < kInfinity) {
           if (distance[v] == kInfinity) touched.push_back(v);
           distance[v] = static_cast<Distance>(candidate);
-          heap.decrease_key(v, distance[v]);
+          frontier.relax(v, distance[v], w);
           on_relax(u, v, distance[v]);
         } else {
           on_non_improving_edge(u, v, candidate);

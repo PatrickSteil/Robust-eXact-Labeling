@@ -7,6 +7,7 @@
 #include "graph.h"
 #include "hub_label.h"
 #include "indexed_minheap.h"
+#include "search_frontier.h"
 #include "types.h"
 
 namespace rxl {
@@ -17,21 +18,20 @@ class HubExpansion {
                       const std::vector<Distance>& root_distance,
                       Distance search_distance);
 
-  static std::uint64_t add_hub(const Graph& graph, VertexId root,
-                               VertexId hub_id, HubLabels& labels,
-                               std::vector<Distance>& root_out,
-                               std::vector<Distance>& root_in,
-                               std::vector<Distance>& distance,
-                               std::vector<VertexId>& lookup_touched,
-                               std::vector<VertexId>& search_touched,
-                               dijkstra_detail::IndexedMinHeap& heap);
+  template <typename Frontier>
+  static std::uint64_t add_hub(
+      const Graph& graph, VertexId root, VertexId hub_id, HubLabels& labels,
+      std::vector<Distance>& root_out, std::vector<Distance>& root_in,
+      std::vector<Distance>& distance, std::vector<VertexId>& lookup_touched,
+      std::vector<VertexId>& search_touched, Frontier& frontier);
 
  private:
+  template <typename Frontier>
   static std::uint64_t pruned_dijkstra(
       const CsrAdjacency& graph, VertexId root, VertexId hub_id,
       const std::vector<Distance>& root_distance, HubLabels& labels,
       bool forward, std::vector<Distance>& distance,
-      std::vector<VertexId>& touched, dijkstra_detail::IndexedMinHeap& heap);
+      std::vector<VertexId>& touched, Frontier& frontier);
 };
 
 }  // namespace rxl
