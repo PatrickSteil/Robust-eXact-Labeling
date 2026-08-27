@@ -13,7 +13,7 @@ namespace rxl {
 
 struct SamplingOptions {
   std::size_t initial_trees = 64;
-  std::size_t counter_buckets = 16;
+  std::size_t counter_buckets = 32;
   std::size_t discarded_max_buckets = 2;
   std::size_t num_threads = 1;
   std::uint64_t random_seed = 0x5eedULL;
